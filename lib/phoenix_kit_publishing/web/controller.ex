@@ -25,6 +25,8 @@ defmodule PhoenixKit.Modules.Publishing.Web.Controller do
   use PhoenixKitWeb, :controller
   use Gettext, backend: PhoenixKitPublishing.Gettext
 
+  require Logger
+
   alias PhoenixKit.Modules.Publishing
   alias PhoenixKit.Modules.Publishing.Constants
   alias PhoenixKit.Modules.Publishing.LanguageHelpers
@@ -550,7 +552,13 @@ defmodule PhoenixKit.Modules.Publishing.Web.Controller do
       _ -> nil
     end
   rescue
-    _ -> nil
+    error ->
+      Logger.warning(
+        "[Publishing] canonical_host_resolver raised, falling back to request host: " <>
+          Exception.message(error)
+      )
+
+      nil
   end
 
   defp strip_language_prefix(url, language) when is_binary(url) and is_binary(language) do
