@@ -10,11 +10,14 @@ defmodule PhoenixKit.Modules.Publishing.Web.PostShow do
   require Logger
 
   alias PhoenixKit.Modules.Publishing
+  alias PhoenixKit.Modules.Publishing.Constants
   alias PhoenixKit.Modules.Publishing.LanguageHelpers
   alias PhoenixKit.Modules.Publishing.PubSub, as: PublishingPubSub
   alias PhoenixKit.Settings
   alias PhoenixKit.Utils.Date, as: UtilsDate
   alias PhoenixKit.Utils.Routes
+
+  @status_published Constants.status_published()
 
   @impl true
   def mount(params, _session, socket) do
@@ -53,7 +56,10 @@ defmodule PhoenixKit.Modules.Publishing.Web.PostShow do
     group_slug = socket.assigns.group_slug
 
     case Publishing.read_post_by_uuid(post_uuid) do
-      {:ok, post} ->
+      # Group-membership check (the editor does the same): without it any
+      # group's post rendered under any other group's URL with that group's
+      # breadcrumbs.
+      {:ok, %{group: ^group_slug} = post} ->
         socket =
           socket
           |> assign(:post, post)
@@ -62,7 +68,7 @@ defmodule PhoenixKit.Modules.Publishing.Web.PostShow do
 
         {:noreply, socket}
 
-      {:error, _} ->
+      _other ->
         {:noreply,
          socket
          |> put_flash(:error, gettext("Post not found"))
@@ -85,13 +91,18 @@ defmodule PhoenixKit.Modules.Publishing.Web.PostShow do
     :ok
   end
 
-  # PubSub handlers for live updates
+  # PubSub handlers for live updates. The broadcast payload is
+  # {:post_updated, %{uuid:, slug:}} — the old 3-tuple head never matched,
+  # so the page never live-updated.
   @impl true
-  def handle_info({:post_updated, _group_slug, _post_slug}, socket) do
-    # Reload post data
-    case Publishing.read_post_by_uuid(socket.assigns.post_uuid) do
-      {:ok, post} -> {:noreply, assign(socket, :post, post)}
-      {:error, _} -> {:noreply, socket}
+  def handle_info({:post_updated, payload}, socket) when is_map(payload) do
+    if payload[:uuid] == socket.assigns[:post_uuid] do
+      case Publishing.read_post_by_uuid(socket.assigns.post_uuid) do
+        {:ok, post} -> {:noreply, assign(socket, :post, post)}
+        {:error, _} -> {:noreply, socket}
+      end
+    else
+      {:noreply, socket}
     end
   end
 
@@ -115,12 +126,12 @@ defmodule PhoenixKit.Modules.Publishing.Web.PostShow do
     end
   end
 
-  def version_status_badge_class("published"), do: "badge-success"
+  def version_status_badge_class(@status_published), do: "badge-success"
   def version_status_badge_class("draft"), do: "badge-warning"
   def version_status_badge_class("archived"), do: "badge-ghost"
   def version_status_badge_class(_), do: "badge-ghost"
 
-  def language_status_color("published"), do: "bg-success"
+  def language_status_color(@status_published), do: "bg-success"
   def language_status_color("draft"), do: "bg-warning"
   def language_status_color("archived"), do: "bg-base-content/20"
   def language_status_color(_), do: "bg-base-content/20"

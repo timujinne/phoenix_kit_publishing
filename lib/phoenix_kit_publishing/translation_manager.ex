@@ -134,6 +134,25 @@ defmodule PhoenixKit.Modules.Publishing.TranslationManager do
       )
     end
 
+    case result do
+      {:error, reason} ->
+        ActivityLog.log_failed_mutation(
+          "publishing.translation.added",
+          ActivityLog.actor_uuid(opts),
+          "publishing_content",
+          nil,
+          %{
+            "group_slug" => group_slug,
+            "post_uuid" => post_uuid,
+            "language" => language_code,
+            "reason" => ActivityLog.reason_string(reason)
+          }
+        )
+
+      _ ->
+        :ok
+    end
+
     result
   end
 
@@ -146,7 +165,7 @@ defmodule PhoenixKit.Modules.Publishing.TranslationManager do
           {:ok, any()} | {:error, any()}
   def add_language_to_db(group_slug, post_uuid, language_code, version_number) do
     with raw_db_post when not is_nil(raw_db_post) <-
-           DBStorage.get_post_by_uuid(post_uuid, [:group]),
+           DBStorage.get_group_post_by_uuid(group_slug, post_uuid, [:group]),
          db_post = StaleFixer.fix_stale_post(raw_db_post),
          version when not is_nil(version) <-
            if(version_number,
@@ -240,21 +259,30 @@ defmodule PhoenixKit.Modules.Publishing.TranslationManager do
           pos_integer() | nil,
           keyword() | map()
         ) :: :ok | {:error, term()}
-  def clear_translation(group_slug, post_uuid, language_code, version \\ nil, opts \\ []) do
-    with db_post when not is_nil(db_post) <- DBStorage.get_post_by_uuid(post_uuid, [:group]),
+  def clear_translation(group_slug, post_uuid, language_code, version \\ nil, opts \\ [])
+      when is_nil(version) or is_integer(version) do
+    repo = PhoenixKit.RepoHelper.repo()
+
+    with db_post when not is_nil(db_post) <-
+           DBStorage.get_group_post_by_uuid(group_slug, post_uuid, [:group]),
          db_version when not is_nil(db_version) <- Shared.resolve_db_version(db_post, version),
          content when not is_nil(content) <-
            DBStorage.get_content(db_version.uuid, language_code),
-         :ok <- validate_not_last_content(db_version, language_code),
-         repo = PhoenixKit.RepoHelper.repo(),
-         {:ok, _} <- repo.delete(content) do
+         :ok <- validate_not_primary_language(language_code),
+         {:ok, :ok} <- delete_content_row_locked(repo, db_post, db_version, content) do
       ListingCache.regenerate(group_slug)
-      PublishingPubSub.broadcast_translation_deleted(group_slug, db_post.uuid, language_code)
+
+      PublishingPubSub.broadcast_translation_deleted(
+        group_slug,
+        db_post.uuid,
+        language_code,
+        version_row_scope(db_version)
+      )
 
       # Match `delete_language/5`'s audit pattern so the destructive
       # branch is auditable. Distinct `action` ("cleared" vs "deleted")
-      # keeps the activity feed from collapsing the two — `delete_language`
-      # archives the content row, `clear_translation` hard-deletes it.
+      # keeps the two entry points tellable apart in the activity feed —
+      # both hard-delete the row since 2026-08 (archiving was reader-dead).
       ActivityLog.log_manual(
         "publishing.translation.cleared",
         ActivityLog.actor_uuid(opts),
@@ -270,9 +298,44 @@ defmodule PhoenixKit.Modules.Publishing.TranslationManager do
 
       :ok
     else
-      nil -> {:error, :not_found}
-      {:error, _} = err -> err
+      nil ->
+        log_translation_failure(
+          {:error, :not_found},
+          "publishing.translation.cleared",
+          opts,
+          group_slug,
+          post_uuid,
+          language_code
+        )
+
+      {:error, _} = err ->
+        log_translation_failure(
+          err,
+          "publishing.translation.cleared",
+          opts,
+          group_slug,
+          post_uuid,
+          language_code
+        )
     end
+  end
+
+  # Post lock + fresh re-check inside one transaction: two concurrent
+  # deletions of the two remaining languages both passed the lockless count
+  # and left the version with ZERO content rows (public :not_found, then
+  # auto-trashed as "empty"). The lock serializes them; the loser re-counts
+  # and refuses. Shared by clear_translation/5 and delete_language/5.
+  defp delete_content_row_locked(repo, db_post, db_version, content) do
+    repo.transaction(fn ->
+      DBStorage.lock_post_row!(repo, db_post.uuid)
+
+      with :ok <- validate_not_last_content(db_version, content.language),
+           {:ok, _} <- repo.delete(content) do
+        :ok
+      else
+        {:error, reason} -> repo.rollback(reason)
+      end
+    end)
   end
 
   defp validate_not_last_content(db_version, language_code) do
@@ -283,25 +346,65 @@ defmodule PhoenixKit.Modules.Publishing.TranslationManager do
     if remaining == [], do: {:error, :last_language}, else: :ok
   end
 
+  # The primary-language row anchors the post: publish requires its title
+  # (validate_primary_title!), its url_slug carries the post's public
+  # identity + 301 history, and the public primary URL would silently serve
+  # another language's body through the fallback chain. Deleting it is never
+  # the right tool — edit the content instead. A legacy BASE-code row ("en"
+  # while primary is "en-US") counts as the primary; an enabled sibling
+  # dialect ("en-GB") does not.
+  defp validate_not_primary_language(language_code) do
+    primary = LanguageHelpers.get_primary_language()
+    down = String.downcase(language_code)
+
+    primary_base =
+      String.downcase(LanguageHelpers.url_language_code(primary) || primary)
+
+    if down == String.downcase(primary) or down == primary_base do
+      {:error, :cannot_delete_primary_language}
+    else
+      :ok
+    end
+  end
+
   @doc """
   Deletes a specific language translation from a post.
 
   For versioned posts, specify the version. For unversioned posts, version is ignored.
-  Refuses to delete the last remaining language content.
+  Refuses to delete the last remaining language content or the primary
+  language's row.
+
+  Hard-deletes the content row (same as `clear_translation/5`). The old
+  behavior set `status: "archived"` — but NO read path anywhere filtered
+  archived content rows, so a "deleted" translation kept serving publicly,
+  kept its url_slug claimed, stayed in `available_languages`, and
+  `create_version_from` resurrected it as a draft in every new version.
+  Dead semantics; the delete now does what its name, log line, and
+  broadcast have always claimed.
 
   Returns :ok on success or {:error, reason} on failure.
   """
   @spec delete_language(String.t(), String.t(), String.t(), integer() | nil, keyword() | map()) ::
           :ok | {:error, term()}
-  def delete_language(group_slug, post_uuid, language_code, version \\ nil, opts \\ []) do
-    with db_post when not is_nil(db_post) <- DBStorage.get_post_by_uuid(post_uuid, [:group]),
+  def delete_language(group_slug, post_uuid, language_code, version \\ nil, opts \\ [])
+      when is_nil(version) or is_integer(version) do
+    repo = PhoenixKit.RepoHelper.repo()
+
+    with db_post when not is_nil(db_post) <-
+           DBStorage.get_group_post_by_uuid(group_slug, post_uuid, [:group]),
          db_version when not is_nil(db_version) <- Shared.resolve_db_version(db_post, version),
          content when not is_nil(content) <-
            DBStorage.get_content(db_version.uuid, language_code),
-         :ok <- validate_not_last_language(db_version),
-         {:ok, _} <- DBStorage.update_content(content, %{status: "archived"}) do
+         :ok <- validate_not_primary_language(language_code),
+         {:ok, :ok} <- delete_content_row_locked(repo, db_post, db_version, content) do
       ListingCache.regenerate(group_slug)
-      PublishingPubSub.broadcast_translation_deleted(group_slug, db_post.uuid, language_code)
+
+      PublishingPubSub.broadcast_translation_deleted(
+        group_slug,
+        db_post.uuid,
+        language_code,
+        version_row_scope(db_version)
+      )
 
       ActivityLog.log_manual(
         "publishing.translation.deleted",
@@ -318,17 +421,46 @@ defmodule PhoenixKit.Modules.Publishing.TranslationManager do
 
       :ok
     else
-      nil -> {:error, :not_found}
-      {:error, _} = err -> err
+      nil ->
+        log_translation_failure(
+          {:error, :not_found},
+          "publishing.translation.deleted",
+          opts,
+          group_slug,
+          post_uuid,
+          language_code
+        )
+
+      {:error, _} = err ->
+        log_translation_failure(
+          err,
+          "publishing.translation.deleted",
+          opts,
+          group_slug,
+          post_uuid,
+          language_code
+        )
     end
   end
 
-  defp validate_not_last_language(db_version) do
-    active =
-      DBStorage.list_contents(db_version.uuid)
-      |> Enum.reject(&(&1.status == "archived"))
+  # Failure chokepoint for the destructive translation paths — a failed
+  # user-driven clear/delete still leaves an audit row (db_pending),
+  # matching the groups/posts/versions convention.
+  defp log_translation_failure({:error, reason} = err, action, opts, group_slug, post_uuid, lang) do
+    ActivityLog.log_failed_mutation(
+      action,
+      ActivityLog.actor_uuid(opts),
+      "publishing_content",
+      nil,
+      %{
+        "group_slug" => group_slug,
+        "post_uuid" => post_uuid,
+        "language" => lang,
+        "reason" => ActivityLog.reason_string(reason)
+      }
+    )
 
-    if length(active) <= 1, do: {:error, :last_language}, else: :ok
+    err
   end
 
   @doc """
@@ -443,6 +575,14 @@ defmodule PhoenixKit.Modules.Publishing.TranslationManager do
       version -> to_string(version)
     end
   end
+
+  # Same scope convention, from a DB version row. The editor compares the
+  # broadcast version against `to_string(socket.assigns.current_version)`, so a
+  # raw integer never matches and the event is silently dropped.
+  defp version_row_scope(%{version_number: number}) when not is_nil(number),
+    do: to_string(number)
+
+  defp version_row_scope(_version), do: nil
 
   # The post's active version number as a string, matching the editor's scope
   # convention. nil (→ active via fetch/3) when there's no active version or the

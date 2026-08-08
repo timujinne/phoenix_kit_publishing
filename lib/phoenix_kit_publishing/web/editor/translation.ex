@@ -8,6 +8,8 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor.Translation do
 
   use Gettext, backend: PhoenixKitPublishing.Gettext
 
+  alias PhoenixKit.Modules.Publishing.Web.Editor.Persistence
+
   import Ecto.Query, only: [from: 2]
 
   alias PhoenixKit.Modules.Publishing
@@ -261,6 +263,31 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor.Translation do
   Actually enqueues the translation job (after confirmation if needed).
   """
   def do_enqueue_translation(socket, target_languages) do
+    # Flush pending source edits FIRST. The worker reads the source text back
+    # out of the DB, and enqueueing also locks this editor — so unsaved prose
+    # would be translated from the previous saved copy while its own queued
+    # autosave took the locked no-op branch and dropped the timer.
+    case flush_source_before_enqueue(socket) do
+      {:blocked, socket} -> {:noreply, socket}
+      {:ok, socket} -> do_enqueue_translation_now(socket, target_languages)
+    end
+  end
+
+  defp flush_source_before_enqueue(socket) do
+    if socket.assigns[:has_pending_changes] and not socket.assigns[:readonly?] do
+      {:noreply, saved} = Persistence.perform_save(socket)
+
+      if saved.assigns.has_pending_changes do
+        {:blocked, saved}
+      else
+        {:ok, saved}
+      end
+    else
+      {:ok, socket}
+    end
+  end
+
+  defp do_enqueue_translation_now(socket, target_languages) do
     user = socket.assigns[:phoenix_kit_current_scope]
     user_uuid = if user, do: user.user.uuid, else: nil
     post = socket.assigns.post
@@ -450,6 +477,23 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor.Translation do
     case socket.assigns[:current_version] do
       nil -> nil
       version -> to_string(version)
+    end
+  end
+
+  # Drops this version's scope from :translations_in_flight and unlocks the
+  # editor UI when the queue is verifiably empty. Only called from the
+  # restore path after Oban reported no active jobs for the scope.
+  defp release_stale_translation_marker(socket, _post) do
+    scope = version_scope(socket)
+    in_flight = socket.assigns[:translations_in_flight] || MapSet.new()
+
+    if scope && MapSet.member?(in_flight, scope) do
+      socket
+      |> Phoenix.Component.assign(:translations_in_flight, MapSet.delete(in_flight, scope))
+      |> Phoenix.Component.assign(:ai_translation_status, nil)
+      |> Phoenix.Component.assign(:translation_locked?, false)
+    else
+      socket
     end
   end
 
@@ -660,7 +704,12 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor.Translation do
     if post && post[:uuid] do
       case in_flight_translation_languages(post.uuid, version_scope(socket)) do
         [] ->
-          socket
+          # Oban shows NO active jobs for this post+version — also RELEASE
+          # any stale in-flight marker. Switching versions mid-translation
+          # made the completion events miss their scope, so the marker never
+          # cleared and switching back re-locked the editor forever ("
+          # Translation in progress" until a full remount).
+          release_stale_translation_marker(socket, post)
 
         target_languages ->
           current_lang = socket.assigns[:current_language]

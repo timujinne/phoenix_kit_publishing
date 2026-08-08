@@ -8,6 +8,7 @@ defmodule PhoenixKit.Modules.Publishing.DBStorage do
 
   import Ecto.Query
 
+  alias PhoenixKit.Modules.Publishing.Constants
   alias PhoenixKit.Modules.Publishing.DBStorage.Mapper
   alias PhoenixKit.Modules.Publishing.LanguageHelpers
   alias PhoenixKit.Modules.Publishing.PublishingContent
@@ -16,6 +17,11 @@ defmodule PhoenixKit.Modules.Publishing.DBStorage do
   alias PhoenixKit.Modules.Publishing.PublishingVersion
 
   require Logger
+
+  # Literals here rather than calls: these appear in function heads and Ecto
+  # query fragments, where only a compile-time value is allowed.
+  @status_published Constants.status_published()
+  @status_draft Constants.status_draft()
 
   @typep changeset_or_struct(struct) ::
            {:ok, struct} | {:error, Ecto.Changeset.t()}
@@ -236,6 +242,35 @@ defmodule PhoenixKit.Modules.Publishing.DBStorage do
     |> maybe_preload(preloads)
   end
 
+  @doc """
+  The same fetch, but only if the post really belongs to `group_slug`.
+
+  Every group-scoped mutation takes a group from the page the caller is on
+  and a uuid from the event they sent, and those two are not checked against
+  each other by `get_post_by_uuid/2` — it looks up the uuid alone. A post
+  uuid is not a secret (the public comment form renders one), so the pairing
+  has to be verified rather than assumed: the group decides which cache to
+  rebuild, which topic to broadcast on, and what the audit row says the
+  actor touched. Answering for a post in another group gets all three wrong,
+  and would be a straightforward hole the moment permissions become
+  per-group rather than per-module.
+  """
+  @spec get_group_post_by_uuid(String.t(), String.t(), list()) :: PublishingPost.t() | nil
+  def get_group_post_by_uuid(group_slug, uuid, preloads \\ []) do
+    case Ecto.UUID.cast(uuid) do
+      {:ok, uuid} ->
+        from(p in PublishingPost,
+          join: g in assoc(p, :group),
+          where: p.uuid == ^uuid and g.slug == ^group_slug
+        )
+        |> repo().one()
+        |> maybe_preload(preloads)
+
+      :error ->
+        nil
+    end
+  end
+
   @doc "Lists posts in a group, optionally filtered by status. Excludes trashed by default."
   @spec list_posts(String.t(), String.t() | nil) :: [PublishingPost.t()]
   def list_posts(group_slug, status \\ nil) do
@@ -256,7 +291,18 @@ defmodule PhoenixKit.Modules.Publishing.DBStorage do
     |> repo().all()
   end
 
-  defp filter_by_status(query, "published"),
+  # A post is published when it points at a live version — the same sentence
+  # the timestamp and slug listing queries each used to spell out for
+  # themselves, one of them nested a level deeper than the other.
+  defp by_publish_state(query, @status_published),
+    do: where(query, [p], not is_nil(p.active_version_uuid))
+
+  defp by_publish_state(query, @status_draft),
+    do: where(query, [p], is_nil(p.active_version_uuid))
+
+  defp by_publish_state(query, _status), do: query
+
+  defp filter_by_status(query, @status_published),
     do: where(query, [p], is_nil(p.trashed_at) and not is_nil(p.active_version_uuid))
 
   defp filter_by_status(query, "draft"),
@@ -266,6 +312,44 @@ defmodule PhoenixKit.Modules.Publishing.DBStorage do
     do: where(query, [p], not is_nil(p.trashed_at))
 
   defp filter_by_status(query, _), do: where(query, [p], is_nil(p.trashed_at))
+
+  @doc """
+  Post uuids in a group whose ACTIVE PUBLISHED version has content matching
+  `query` — a case-insensitive substring over per-language title + body — in
+  any of the candidate languages. ILIKE wildcards in the user's input are
+  escaped, so a search for "50%" matches the literal text. Capped at `limit`.
+
+  Returns bare uuids (not post maps) by design: the public search path
+  filters the listing-cache's chronological maps by this set, reusing all the
+  title/URL/language resolution the listing already does.
+  """
+  @spec search_published_post_uuids(String.t(), [String.t()], String.t(), pos_integer()) ::
+          [String.t()]
+  def search_published_post_uuids(group_slug, language_candidates, query, limit) do
+    pattern = "%" <> escape_like(query) <> "%"
+
+    from(p in PublishingPost,
+      join: g in assoc(p, :group),
+      join: v in PublishingVersion,
+      on: v.uuid == p.active_version_uuid,
+      join: c in PublishingContent,
+      on: c.version_uuid == v.uuid,
+      where: g.slug == ^group_slug and is_nil(p.trashed_at),
+      where: v.status == @status_published,
+      where: c.language in ^language_candidates,
+      where: ilike(c.title, ^pattern) or ilike(c.content, ^pattern),
+      distinct: true,
+      select: p.uuid,
+      limit: ^limit
+    )
+    |> repo().all()
+  end
+
+  # Prefix every LIKE metacharacter (backslash first, then % and _) so user
+  # input is always a literal substring match.
+  defp escape_like(query) do
+    String.replace(query, ~r/[\\%_]/, fn match -> "\\" <> match end)
+  end
 
   @doc "Counts non-trashed posts in a group."
   @spec count_posts(String.t()) :: non_neg_integer()
@@ -314,11 +398,7 @@ defmodule PhoenixKit.Modules.Publishing.DBStorage do
       )
 
     query =
-      case status do
-        "published" -> where(query, [p], not is_nil(p.active_version_uuid))
-        "draft" -> where(query, [p], is_nil(p.active_version_uuid))
-        _ -> query
-      end
+      by_publish_state(query, status)
 
     query =
       case Keyword.get(opts, :date) do
@@ -346,11 +426,7 @@ defmodule PhoenixKit.Modules.Publishing.DBStorage do
         preload: [group: g]
       )
 
-    case status do
-      "published" -> where(query, [p], not is_nil(p.active_version_uuid))
-      "draft" -> where(query, [p], is_nil(p.active_version_uuid))
-      _ -> query
-    end
+    by_publish_state(query, status)
     |> repo().all()
   end
 
@@ -848,7 +924,12 @@ defmodule PhoenixKit.Modules.Publishing.DBStorage do
 
     case find_free_suffix(base_slug, group_slug, content.language, content.uuid, start_n) do
       {:ok, new_slug} ->
-        case update_content(content, %{url_slug: new_slug}) do
+        # The displaced slug joins previous_url_slugs so the established
+        # public URL 301s to the renamed one instead of dying — the editor's
+        # normal slug-change flow records history; this self-heal must too.
+        data = record_displaced_slug(content.data || %{}, base_slug, new_slug)
+
+        case update_content(content, %{url_slug: new_slug, data: data}) do
           {:ok, _updated} ->
             Logger.warning(
               "[Publishing] Auto-resolved url_slug collision: content #{content.uuid} renamed " <>
@@ -953,19 +1034,106 @@ defmodule PhoenixKit.Modules.Publishing.DBStorage do
         contents =
           from(c in PublishingContent,
             join: v in assoc(c, :version),
-            where: v.post_uuid == ^db_post.uuid and c.url_slug == ^url_slug_to_clear,
-            select: {c, c.language}
+            where: v.post_uuid == ^db_post.uuid and c.url_slug == ^url_slug_to_clear
           )
           |> repo().all()
 
-        from(c in PublishingContent,
-          join: v in assoc(c, :version),
-          where: v.post_uuid == ^db_post.uuid and c.url_slug == ^url_slug_to_clear
-        )
-        |> repo().update_all(set: [url_slug: nil, updated_at: DateTime.utc_now()])
+        # Per-row (not update_all): the cleared slug must join each row's
+        # previous_url_slugs so the established public URL keeps 301ing to
+        # this post — clearing without history silently handed the URL to
+        # whichever post triggered the collision.
+        Enum.each(contents, fn content ->
+          data = record_displaced_slug(content.data || %{}, url_slug_to_clear, nil)
+          update_content(content, %{url_slug: nil, data: data})
+        end)
 
-        Enum.map(contents, fn {_content, lang} -> lang end) |> Enum.uniq()
+        Enum.map(contents, & &1.language) |> Enum.uniq()
     end
+  end
+
+  @doc """
+  Row-locks a post (`FOR UPDATE`) inside the caller's transaction — the
+  same lock `Versions.publish_version/unpublish/delete` take, so any writer
+  that acquires it serializes with the publish machinery. Returns the fresh
+  post row (or nil).
+  """
+  @spec lock_post_row!(module(), String.t()) :: PublishingPost.t() | nil
+  def lock_post_row!(repo, post_uuid) do
+    from(p in PublishingPost, where: p.uuid == ^post_uuid, lock: "FOR UPDATE")
+    |> repo.one()
+  end
+
+  @doc "Fetches a version by its uuid."
+  @spec get_version_by_uuid(String.t()) :: PublishingVersion.t() | nil
+  def get_version_by_uuid(version_uuid) do
+    repo().get(PublishingVersion, version_uuid)
+  end
+
+  @doc """
+  Row-locks a group (`FOR UPDATE`) inside the caller's transaction and
+  returns the fresh row — the group-save equivalent of `lock_post_row!/2`.
+  """
+  @spec lock_group_row!(module(), String.t()) :: PublishingGroup.t() | nil
+  def lock_group_row!(repo, group_uuid) do
+    from(g in PublishingGroup, where: g.uuid == ^group_uuid, lock: "FOR UPDATE")
+    |> repo.one()
+  end
+
+  @doc """
+  Clears a post's `active_version_uuid` ONLY when it still equals
+  `expected_uuid` — the compare-and-swap StaleFixer's pointer heal needs.
+  A plain write raced concurrent publishes: the fixer judged the pointer
+  stale from an earlier read, a publish moved it to a fresh version in
+  between, and the unconditional clear reverted the publish. Returns the
+  number of rows updated (0 = the pointer moved; do nothing).
+  """
+  @spec clear_active_version_if(String.t(), String.t()) :: non_neg_integer()
+  def clear_active_version_if(post_uuid, expected_uuid) do
+    {count, _} =
+      from(p in PublishingPost,
+        where: p.uuid == ^post_uuid and p.active_version_uuid == ^expected_uuid
+      )
+      |> repo().update_all(set: [active_version_uuid: nil, updated_at: DateTime.utc_now()])
+
+    count
+  end
+
+  @doc """
+  Demotes a published version to draft ONLY while its post's
+  `active_version_uuid` is still NULL — the orphan-demotion StaleFixer runs
+  from a possibly-stale snapshot, and an unconditional demote could draft a
+  version a concurrent publish just made live. One atomic statement; returns
+  the number of rows updated.
+  """
+  @spec demote_version_if_orphaned(String.t(), String.t()) :: non_neg_integer()
+  def demote_version_if_orphaned(version_uuid, post_uuid) do
+    orphaned_post =
+      from(p in PublishingPost, where: p.uuid == ^post_uuid and is_nil(p.active_version_uuid))
+
+    {count, _} =
+      from(v in PublishingVersion,
+        where:
+          v.uuid == ^version_uuid and v.status == ^Constants.status_published() and
+            exists(orphaned_post)
+      )
+      |> repo().update_all(set: [status: "draft", updated_at: DateTime.utc_now()])
+
+    count
+  end
+
+  # Mirrors the editor flow's Posts.record_previous_url_slug/3: displaced
+  # slug prepended to data["previous_url_slugs"], deduped, never containing
+  # the row's own new slug (a history entry equal to the current slug would
+  # 301-loop).
+  defp record_displaced_slug(data, old_slug, new_slug) do
+    previous = data["previous_url_slugs"] || []
+
+    updated =
+      [old_slug | previous]
+      |> Enum.reject(&(&1 in [nil, "", new_slug]))
+      |> Enum.uniq()
+
+    Map.put(data, "previous_url_slugs", updated)
   end
 
   @doc "Upserts content by version_id + language using ON CONFLICT."
@@ -1049,7 +1217,7 @@ defmodule PhoenixKit.Modules.Publishing.DBStorage do
     # Also find published versions that differ from latest (for status overlay)
     published_by_post =
       Map.new(all_versions_by_post, fn {post_uuid, versions} ->
-        {post_uuid, Enum.find(versions, fn v -> v.status == "published" end)}
+        {post_uuid, Enum.find(versions, &Constants.published?(&1.status))}
       end)
 
     # The post-level status must reflect what's LIVE, not the newest revision:
@@ -1062,7 +1230,7 @@ defmodule PhoenixKit.Modules.Publishing.DBStorage do
       Map.new(posts, fn post ->
         versions = Map.get(all_versions_by_post, post.uuid, [])
         active = find_active_version(versions, Map.get(post, :active_version_uuid))
-        {post.uuid, if(active != nil and active.status == "published", do: active)}
+        {post.uuid, if(active != nil and Constants.published?(active.status), do: active)}
       end)
 
     # Collect all version UUIDs we need contents for (latest + published if different)
@@ -1091,15 +1259,43 @@ defmodule PhoenixKit.Modules.Publishing.DBStorage do
         version,
         all_contents_by_version,
         published_by_post,
-        # The live (active, published) version drives both the post-level
-        # status AND the visible publish date — the mapped latest revision
-        # of a live post is a draft with a nil published_at.
-        if(live,
-          do: [effective_status: "published", effective_published_at: live.published_at],
-          else: []
-        )
+        # The live (active, published) version drives the post-level status,
+        # the visible publish date, AND the card title — the mapped latest
+        # revision of a live post is a draft whose title/date may differ
+        # from what readers see. (Maintainer call 2026-07-27: the admin card
+        # must read like the public post; the per-language/per-version maps
+        # stay latest-version for editing context.)
+        live_effective_opts(live, all_contents_by_version)
       )
     end)
+  end
+
+  # Effective-override opts for a post whose ACTIVE version is published:
+  # status, publish date, and title all follow the live version. The title
+  # picks the live version's primary-language content (the same rule the
+  # mapper's primary_content uses), falling back to its first content row.
+  defp live_effective_opts(nil, _all_contents_by_version), do: []
+
+  defp live_effective_opts(live, all_contents_by_version) do
+    base = [
+      effective_status: @status_published,
+      effective_published_at: live.published_at,
+      effective_live_version: live.version_number
+    ]
+
+    live_contents = Map.get(all_contents_by_version, live.uuid, [])
+
+    primary =
+      Enum.find(live_contents, &(&1.language == LanguageHelpers.get_primary_language())) ||
+        List.first(live_contents)
+
+    case primary do
+      %{title: title} when is_binary(title) and title != "" ->
+        [effective_title: title] ++ base
+
+      _ ->
+        base
+    end
   end
 
   @doc """
@@ -1142,7 +1338,13 @@ defmodule PhoenixKit.Modules.Publishing.DBStorage do
       version = active_by_post[post.uuid]
       contents = Map.get(all_contents_by_version, version.uuid, [])
 
-      Mapper.to_listing_map(post, version, contents, all_versions)
+      # Categories live on the version, so the listing shows the filing of the
+      # version it is actually displaying — the active one. No join needed;
+      # the version is already loaded, which is one fewer query per rebuild
+      # than the post-level table cost.
+      post
+      |> Mapper.to_listing_map(version, contents, all_versions)
+      |> Map.put(:category_uuids, PublishingVersion.get_category_uuids(version))
     end)
   end
 

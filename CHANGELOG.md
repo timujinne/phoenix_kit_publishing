@@ -1,5 +1,236 @@
 # Changelog
 
+## 0.4.7 - 2026-08-04
+
+PR #38 — the public + admin language surfaces, sibling-dialect URLs, and a
+concurrency-hardening pass — plus the post-merge review fixes. 0.4.6 was
+tagged before this merge landed, so the whole wave ships here.
+
+### Added
+- **Sibling dialects of one base now have their own public URLs.**
+  `LanguageHelpers.public_url_segment/1` gives a non-owner dialect its full
+  lowercase code (`/en-gb/…`) while the base's owner dialect keeps the
+  historical base segment (`/en/…`), so no existing URL changes. Routing,
+  canonical redirects, the language switcher, feeds, and term archives all
+  pin the segment through the same helper.
+- **Cluster-wide listing-cache invalidation.** `ListingCache.CacheSync`, a
+  supervised node-local subscriber, erases this node's `:persistent_term`
+  listing entries when another node invalidates a group. `:persistent_term`
+  is process-less, so a peer node's warm cache previously kept serving
+  pre-mutation listings (rename/trash/delete, category changes) until an
+  unrelated local mutation. Erase-only — the next read rebuilds lazily, so an
+  invalidation can never start a cluster-wide regeneration storm.
+- **Canonical-prefix 301s for feeds, search results, and term archives**,
+  matching the plain listing. Feed redirects are strictly feed-to-feed.
+- **Failure-side activity rows** for category create/update/delete/reorder,
+  translation add/clear/delete, version create, and public comment create —
+  every user-driven mutation now leaves a `db_pending` audit row when it
+  fails. `ActivityLog.reason_string/1` keeps changesets (user free text) out
+  of metadata.
+
+### Changed
+- **`delete_language/5` hard-deletes the content row** instead of setting
+  `status: "archived"`. No read path ever filtered archived rows, so a
+  "deleted" translation kept serving publicly, kept its `url_slug` claimed,
+  stayed in `available_languages`, and `create_version_from` resurrected it
+  as a draft in every new version. Versions remain the undo mechanism.
+- **The primary language's content row can no longer be deleted** by
+  `clear_translation/5` or `delete_language/5` — new
+  `:cannot_delete_primary_language` error. It anchors publish validation, the
+  post's `url_slug` identity, and the public primary URL. A legacy base-code
+  row (`"en"` while primary is `"en-US"`) counts as primary; an enabled
+  sibling (`"en-GB"`) does not.
+- **Collaborative form keys are version-scoped** (`<group>:<uuid>:v<N>:<lang>`)
+  and new-post keys are socket-scoped. Editors on v1 and v2 of the same
+  language shared one lock/sync channel, and two admins composing new posts
+  shared one lock.
+- **Listing previews and feed item descriptions derive per-language.** The
+  version-level `data["description"]` carries no language, so it showed one
+  language's text under every language's title; it is now only the
+  last-resort `og:description` default.
+- **Presence metas carry `%{uuid, email}`, not the full `%User{}` struct**
+  (`hashed_password` included — `redact:` only affects `Inspect`).
+- Removed the unrouted all-groups overview template and the dead
+  `dashboard_summary` assign, `build_summary/2`, and
+  `PubSub.editor_presence_topic/1`.
+
+### Fixed
+- **StaleFixer could revert a concurrent publish.** The active-version
+  pointer heal is now a compare-and-swap (`clear_active_version_if/2`) and
+  the orphan demotion is conditional on the pointer still being NULL
+  (`demote_version_if_orphaned/2`), with a fresh re-read between them.
+- **Post saves take the post row lock** with an in-transaction version
+  re-read, closing the save-vs-publish status TOCTOU and the lost updates
+  parallel AI-translation jobs inflicted on `version.data` (tags and legacy
+  promotions clobbering each other).
+- **Group-settings saves take the group row lock** and re-merge against the
+  fresh `data` — two concurrent saves used to read the same snapshot and the
+  second silently reverted the first's setting keys.
+- **Concurrent deletes could empty a version or a post.** Translation
+  clear/delete and version delete now re-check "is this the last one" under
+  the lock.
+- **`name_i18n` merges per key.** The edit form only renders tabs for enabled
+  languages, so a wholesale replace wiped the override of any language
+  disabled after it was translated.
+- **`:translation_deleted` now carries the version as a string**, matching
+  `:translation_created` and the editor's `current_version` scope. An integer
+  never compared equal, so the editor silently kept showing a language pill
+  for a translation that no longer existed.
+- **Sibling-language editors reload on shared version-field saves**, via a
+  mirrored `:sibling_editor_saved` broadcast on the post's translations
+  topic. Without it, a stale tab's next autosave reverted the sibling's
+  categories and `published_at` (and so a timestamp post's public URL).
+- **A never-edited V1 post no longer loses its featured image and
+  description** on public surfaces — the mapper falls back to the legacy
+  per-language `content.data` values until promotion-on-first-edit runs.
+- **Untranslated stubs stop rendering as empty published pages.** "Add
+  language" writes `{title: "Untitled", content: ""}` onto the active
+  version, instantly public; those now read as a missing translation and go
+  through the smart fallback, and they no longer produce Untitled listing
+  cards.
+- **A slug displaced by the collision self-healer joins
+  `previous_url_slugs`**, so the established public URL 301s to the renamed
+  one instead of being silently handed to the colliding post.
+- **Date-count URL disambiguation is computed across all languages**
+  (`Listing.group_date_counts/1`) — URL resolution is language-agnostic, so a
+  language-filtered count emitted a date-only URL whose same-day sibling
+  merely lacked the viewer's translation, resolving to a different post.
+- **Public strings render in the right locale.** `Gettext.put_locale/2` is
+  given the base code — catalogue directories are base-coded and gettext has
+  no dialect fallback, so `"fr-FR"` matched nothing and every public string
+  silently fell back to English. Comment-submission flashes set the locale
+  too, and the notes section, `live` badge, and two admin page titles are now
+  translatable.
+- **Card excerpts are plain prose again**: PHK component markup is stripped
+  before derivation (a truncated tag used to survive as escaped junk),
+  `<style>`/`<script>` bodies are dropped rather than inlined as a wall of
+  CSS, and HTML entities are decoded so `Fish & chips` stops reading
+  `Fish &amp; chips`.
+- **A malformed post UUID no longer crashes the LiveView** —
+  `read_post_by_uuid/3` casts first and returns `{:error, :not_found}`.
+  Crafted `switch_language` / `set_new_version_source` payloads and bare
+  `/:group/edit` URLs are handled too.
+- **PostShow live-updates again** (its `handle_info` head never matched the
+  broadcast payload) and checks group membership, so one group's post can no
+  longer render under another group's URL.
+- **The admin dashboard stops multiplying its PubSub subscriptions.**
+  `Phoenix.PubSub.subscribe/2` is not idempotent; every debounced refresh
+  re-subscribed, delivering each post event N times.
+- **AI source reads fail closed on a language mismatch** — the read falls
+  back to another language when the requested row is missing, and translating
+  that text labelled as the source language fanned wrong output out to every
+  target.
+- **The category `parent_uuid` FK is constrained in the changeset**, so a
+  raced parent delete surfaces as a validation error rather than a 500.
+- Editor and admin fixes: typing in the create-group custom-type box no
+  longer wipes name/slug and flips the mode radio; a group-slug collision
+  flashes instead of raising `CaseClauseError`; erasing a custom `url_slug`
+  restores the default as the UI promises; publish failures name the real
+  reason and unblock language/version switching; remote version deletion does
+  a full editor transition (form, client content, URL); stuck translation
+  locks self-release when Oban reports no active jobs; language pills open
+  the version that actually holds the language; branching a version keeps the
+  language pin and clearing a translation keeps the version pin.
+
+## 0.4.6 - 2026-08-04
+
+### Fixed
+- **The `leaf` requirement no longer locks hosts out of the release.** 0.4.5
+  declared `{:leaf, "~> 0.4.1"}`, which was written meaning "0.4.1 or later" but
+  reads as `>= 0.4.1 and < 0.5.0`. phoenix_kit core declares `~> 0.3`, so a host
+  resolving both got leaf 0.5.1 — and with 0.5.x excluded here, the resolver
+  quietly settled on publishing **0.4.4**, silently withholding the entire 0.4.5
+  wave. `mix deps.update` could not break the tie; the only escape was pinning
+  leaf back to 0.4.x in the host's `mix.exs`, i.e. downgrading the editor.
+
+  The requirement is now `~> 0.4.1 or ~> 0.5`. The 0.4.1 floor still stands (it
+  is where inline suggestions and `:flush` arrived); only the accidental ceiling
+  is gone. leaf 0.5 removed nothing this package calls — its attr set is a strict
+  superset of 0.4.1's, and the message contract only gained `{:leaf_flushed, …}`.
+
+  Hosts loading leaf's JS the documented way
+  (`import "../../../deps/leaf/priv/static/assets/leaf.js"`) move to the 0.5
+  bundle automatically. A **CDN pin or a vendored copy of `leaf.js` must be
+  updated by hand** — 0.5 is a server↔client contract change, and a bundle left
+  behind fails silently. leaf 0.5.1 logs a console warning when it detects this.
+
+## 0.4.5 - 2026-08-01
+
+PR #37 — the publishing wave (Leaf editor, per-version categories,
+gallery/notes/audio/comments, RSS feeds, search, view counts and a security
+pass), plus the post-merge review fixes. 0.4.4 shipped before any of this
+landed, so this release carries the whole wave.
+
+### Added
+- **Categories** — hierarchical, per-group taxonomy (`Publishing.Categories`,
+  `PublishingCategory`), filed **per version** in `version.data["category_uuids"]`
+  so a reader on `?v=2` sees how v2 was filed. Admin tree at
+  `/admin/publishing/categories/:group` with drag reorder, "Move to…"
+  re-parenting (cycle-checked under a row lock) and a typeahead picker in the post
+  editor. Public archives at `/<group>/category/<slug>`, parent archives including
+  their children. Legacy post-level rows are drained on first cache regeneration.
+- **Body hashtags as the tag system** — writers type `#elixir` inline and the
+  version's tags derive from the prose on save; the separate tags field is gone.
+  Code regions, headings, URL fragments and Markdown links are excluded by
+  construction. Public tag archives at `/<group>/tag/<tag>`.
+- **RSS 2.0 feeds** per group and per category/tag archive
+  (`/<group>/feed.xml`), gated by `publishing_feeds_enabled`, with podcast-style
+  `<enclosure>` when a post carries an audio version.
+- **Public listing search** (`?q=`, plain GET, no JS) behind the group's
+  `search_enabled` setting.
+- **View counts** (`Publishing.Views`) — per-day rollups, bot-filtered and
+  session-deduped, no reader PII. `views_enabled` / `show_view_counts`.
+- **Comments** — guarded seam to the optional `phoenix_kit_comments` package:
+  dead-view thread, honeypot + signed time-trap form, per-note threads.
+- **`<Showcase>`, `<Gallery>`, `<Audio>` and `<Note>` components** — an
+  edge-bled image band, a CSS-only image helix (no JS; degrades to a plain grid),
+  inline audio, and author notes in footnote or slide-out-panel style.
+- **Leaf visual editor** replaces the old Markdown editor, with `preserve_tags`
+  wired to `Renderer.component_tags/0` so a WYSIWYG round trip can't flatten a
+  component.
+- **New group settings** — `listing_layout`, `notes_style`, `show_prev_next`,
+  `show_categories`, `search_enabled`, `views_enabled`, `show_view_counts`,
+  `comments_enabled`.
+
+### Fixed
+- **Scheduled posts went public at the wrong hour.** `post_date`/`post_time` are
+  stamped and displayed on the site's `time_zone` wall clock, but the new
+  release check compared them against UTC — so on a site west of UTC an embargoed
+  post appeared *early* by the offset (and late on a site east of it). The offset
+  now has one owner (`Constants.site_offset_seconds/0`), shared by the stamping
+  path so the two clocks cannot drift, and the release check runs on the site
+  clock. Only sites left at the `"0"` default were unaffected.
+- **RSS `pubDate` / `lastBuildDate` were off by the site's UTC offset** — same
+  root cause; the site-local instant is now converted back to UTC before it is
+  stamped `+0000`.
+- **A category-tree query fired on every keystroke in the post editor** — the
+  picker is a stateful LiveComponent, whose `update/2` runs on every parent
+  render. It now reuses the tree it holds and re-reads on search (where
+  freshness is load-bearing) or a group change.
+- **`Hashtags.suggest/3` returned lowercase tags** while documenting that it
+  keeps the group's own spelling; it now does, and folds both sides before
+  matching so the change can't cost a match.
+- **`mix test` failed without a database** — the new `dispatch_e2e_test.exs`
+  missed the `:integration` tag every other DB-backed test inherits from its
+  case template.
+- Removed two unreachable branches (`Hashtags.tag_counts/1`'s `%{posts: …}`
+  clause, `Categories.update_category/3`'s bare `:error`).
+
+### Changed
+- `show_tags` (per-group setting and `PublishingGroup.show_tags?/1`) is
+  **removed** — tags live in the prose now and the post-page chip row is gone.
+  Existing groups keep the key in their `data` JSONB, unread.
+- New error atoms registered with `Publishing.Errors` (`:params_not_applied`,
+  `:category_cycle`, `:parent_not_found`, `:parent_wrong_group`,
+  `:invalid_order`) so they render as sentences rather than
+  "Unexpected error: …".
+- `mix credo --strict` and `mix dialyzer` are green again (29 findings across
+  the wave: aliasing, nesting depth, four complexity hotspots, the
+  `PhoenixKitComments` optional-seam dialyzer ignore, and a `MapSet` opacity
+  violation in the category tree walk). Behaviour-preserving throughout.
+
+Full review: `dev_docs/pull_requests/2026/37-publishing-wave-leaf-categories-comments/CLAUDE_REVIEW.md`.
+
 ## 0.4.4 - 2026-07-25
 
 Documentation-only release. No code changes — published so the new README

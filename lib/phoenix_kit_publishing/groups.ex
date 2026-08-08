@@ -33,12 +33,16 @@ defmodule PhoenixKit.Modules.Publishing.Groups do
   @scrollbar_styles Constants.scrollbar_styles()
   @default_listing_sort Constants.default_listing_sort()
   @listing_sorts Constants.listing_sorts()
+  @default_listing_layout Constants.default_listing_layout()
+  @listing_layouts Constants.listing_layouts()
   @default_timeline_granularity Constants.default_timeline_granularity()
   @timeline_granularities Constants.timeline_granularities()
   @default_post_date_position Constants.default_post_date_position()
   @post_date_positions Constants.post_date_positions()
   @default_post_width Constants.default_post_width()
   @post_widths Constants.post_widths()
+  @default_notes_style Constants.default_notes_style()
+  @notes_styles Constants.notes_styles()
   @type_regex ~r/^[a-z][a-z0-9-]{0,31}$/
 
   @type_item_names %{
@@ -224,7 +228,7 @@ defmodule PhoenixKit.Modules.Publishing.Groups do
   Updates a publishing group's display name and slug.
   """
   @spec update_group(String.t(), map() | keyword(), keyword() | map()) ::
-          {:ok, group()} | {:error, atom()}
+          {:ok, group()} | {:error, atom() | Ecto.Changeset.t()}
   def update_group(slug, params, opts \\ []) when is_binary(slug) do
     case DBStorage.get_group_by_slug(slug) do
       nil ->
@@ -241,12 +245,7 @@ defmodule PhoenixKit.Modules.Publishing.Groups do
       db_group ->
         with {:ok, name} <- extract_and_validate_name(db_group, params),
              {:ok, sanitized_slug} <- extract_and_validate_slug(db_group, params, name),
-             {:ok, updated} <-
-               DBStorage.update_group(db_group, %{
-                 name: name,
-                 slug: sanitized_slug,
-                 data: merge_group_config(db_group.data, params)
-               }) do
+             {:ok, updated} <- write_group_update_locked(db_group, name, sanitized_slug, params) do
           # A slug rename orphans the old slug's listing cache entry — it leaks in
           # :persistent_term and keeps serving stale data under the old key (L6).
           if db_group.slug != updated.slug, do: ListingCache.invalidate(db_group.slug)
@@ -293,8 +292,10 @@ defmodule PhoenixKit.Modules.Publishing.Groups do
   # not a hand-maintained copy).
   @bool_setting_keys ~w(featured_enabled newest_enabled scroll_progress_enabled
                         scroll_headings_enabled scroll_timeline_enabled show_breadcrumbs
-                        show_featured_image show_reading_time show_tags show_post_count
-                        show_top_back_link listing_image_links listing_animations)
+                        show_featured_image show_reading_time show_post_count
+                        show_top_back_link listing_image_links listing_animations
+                        show_prev_next search_enabled show_categories
+                        views_enabled show_view_counts comments_enabled)
   @enum_settings [
     {"featured_layout", @featured_layouts},
     {"featured_style", @band_styles},
@@ -303,8 +304,10 @@ defmodule PhoenixKit.Modules.Publishing.Groups do
     {"scrollbar_style", @scrollbar_styles},
     {"scroll_timeline_granularity", @timeline_granularities},
     {"listing_sort", @listing_sorts},
+    {"listing_layout", @listing_layouts},
     {"post_date_position", @post_date_positions},
-    {"post_width", @post_widths}
+    {"post_width", @post_widths},
+    {"notes_style", @notes_styles}
   ]
 
   @doc false
@@ -339,28 +342,68 @@ defmodule PhoenixKit.Modules.Publishing.Groups do
   defp merge_group_config(existing_data, _params), do: existing_data
 
   # Per-language display-name overrides arrive as a `%{lang => name}` map (form
-  # inputs named `group[name_i18n][<lang>]`). Store the non-blank set wholesale;
-  # an all-blank submission clears the key. Only touched when submitted, so
-  # callers that don't edit the name (or keyword-list callers) leave it intact.
-  # Entries with a non-binary value (e.g. a nested map from crafted params or a
-  # programmatic caller) are dropped rather than raising, and each override is
-  # capped to the same max length the primary `name` column enforces.
+  # The config merge is read-modify-write over the whole data JSONB — the
+  # same shape the post save locks for (`lock_post_row!`). Without the
+  # group-row lock, two concurrent group-edit saves read the same snapshot
+  # and the second silently reverted the first's setting keys. The merge
+  # re-runs against the FRESH data under the lock.
+  defp write_group_update_locked(db_group, name, sanitized_slug, params) do
+    repo = PhoenixKit.RepoHelper.repo()
+
+    repo.transaction(fn ->
+      fresh = DBStorage.lock_group_row!(repo, db_group.uuid) || db_group
+      apply_group_update!(repo, fresh, name, sanitized_slug, params)
+    end)
+  end
+
+  # Runs inside `write_group_update_locked/4`'s transaction — `rollback/1`
+  # throws, so returning the updated struct is the only success path.
+  defp apply_group_update!(repo, fresh, name, sanitized_slug, params) do
+    case DBStorage.update_group(fresh, %{
+           name: name,
+           slug: sanitized_slug,
+           data: merge_group_config(fresh.data, params)
+         }) do
+      {:ok, updated} -> updated
+      {:error, reason} -> repo.rollback(reason)
+    end
+  end
+
+  # inputs named `group[name_i18n][<lang>]`). Per-key merge over the stored
+  # map: a submitted non-blank value sets its key, a submitted BLANK deletes
+  # it, and a key the form didn't submit at all is kept — the edit form only
+  # renders tabs for ENABLED languages, so a wholesale replace silently wiped
+  # the override of any language disabled after it was translated (re-enable
+  # and the name was gone). Only touched when submitted, so callers that
+  # don't edit the name (or keyword-list callers) leave it intact. Entries
+  # with a non-binary value (e.g. a nested map from crafted params) are
+  # ignored rather than raising, and each override is capped to the same max
+  # length the primary `name` column enforces.
   defp merge_name_i18n(data, params) do
     case Map.fetch(params, "name_i18n") do
       {:ok, translations} when is_map(translations) ->
-        cleaned =
-          translations
-          |> Enum.flat_map(&clean_name_i18n_entry/1)
-          |> Map.new()
+        merged = Enum.reduce(translations, data["name_i18n"] || %{}, &apply_name_i18n_entry/2)
 
-        if cleaned == %{},
+        if merged == %{},
           do: Map.delete(data, "name_i18n"),
-          else: Map.put(data, "name_i18n", cleaned)
+          else: Map.put(data, "name_i18n", merged)
 
       _ ->
         data
     end
   end
+
+  defp apply_name_i18n_entry({lang, value}, acc)
+       when (is_binary(lang) or is_atom(lang)) and is_binary(value) do
+    key = to_string(lang)
+
+    case clean_name_i18n_entry({lang, value}) do
+      [{^key, cleaned}] -> Map.put(acc, key, cleaned)
+      [] -> Map.delete(acc, key)
+    end
+  end
+
+  defp apply_name_i18n_entry(_entry, acc), do: acc
 
   defp clean_name_i18n_entry({lang, value})
        when (is_binary(lang) or is_atom(lang)) and is_binary(value) do
@@ -698,16 +741,23 @@ defmodule PhoenixKit.Modules.Publishing.Groups do
       "scroll_timeline_granularity" =>
         Map.get(data, "scroll_timeline_granularity", @default_timeline_granularity),
       "listing_sort" => Map.get(data, "listing_sort", @default_listing_sort),
+      "listing_layout" => Map.get(data, "listing_layout", @default_listing_layout),
       "show_breadcrumbs" => Map.get(data, "show_breadcrumbs", false),
       "post_date_position" => Map.get(data, "post_date_position", @default_post_date_position),
       "post_width" => Map.get(data, "post_width", @default_post_width),
+      "notes_style" => Map.get(data, "notes_style", @default_notes_style),
       "show_featured_image" => Map.get(data, "show_featured_image", false),
       "show_reading_time" => Map.get(data, "show_reading_time", false),
-      "show_tags" => Map.get(data, "show_tags", false),
       "show_post_count" => Map.get(data, "show_post_count", false),
       "show_top_back_link" => Map.get(data, "show_top_back_link", true),
       "listing_image_links" => Map.get(data, "listing_image_links", true),
       "listing_animations" => Map.get(data, "listing_animations", true),
+      "show_prev_next" => Map.get(data, "show_prev_next", false),
+      "search_enabled" => Map.get(data, "search_enabled", false),
+      "show_categories" => Map.get(data, "show_categories", false),
+      "views_enabled" => Map.get(data, "views_enabled", false),
+      "show_view_counts" => Map.get(data, "show_view_counts", false),
+      "comments_enabled" => Map.get(data, "comments_enabled", false),
       "name_i18n" => name_i18n_map(data)
     }
   end

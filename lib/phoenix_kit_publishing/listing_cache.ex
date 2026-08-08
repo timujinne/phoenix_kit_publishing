@@ -36,6 +36,7 @@ defmodule PhoenixKit.Modules.Publishing.ListingCache do
   - On invalidate: clears :persistent_term entry (next read triggers regeneration)
   """
 
+  alias PhoenixKit.Modules.Publishing.Categories
   alias PhoenixKit.Modules.Publishing.Constants
   alias PhoenixKit.Modules.Publishing.DBStorage
 
@@ -137,6 +138,14 @@ defmodule PhoenixKit.Modules.Publishing.ListingCache do
   def regenerate(group_slug, opts \\ []) do
     broadcast? = Keyword.get(opts, :broadcast, true)
 
+    # Categories moved from a post-level join table onto the versions. This is
+    # where the one-time move happens, because it is the one path every group
+    # goes through — public archives, admin listings, cache warmups — and a
+    # site whose archives are the only thing reading categories would never
+    # reach an admin-only hook. It drains the legacy rows, so the steady state
+    # is a single query that finds nothing.
+    Categories.backfill_version_categories(group_slug)
+
     if memory_cache_enabled?() do
       do_regenerate(group_slug, broadcast?)
     else
@@ -202,11 +211,22 @@ defmodule PhoenixKit.Modules.Publishing.ListingCache do
 
     generated_at = UtilsDate.utc_now() |> DateTime.to_iso8601()
 
-    # Two puts, not three: the loaded-at and generated-at timestamps were always
-    # written with the SAME value, and each :persistent_term.put triggers a global
-    # GC pass — wasteful under autosave traffic. Store the timestamp once (L12).
-    safe_persistent_term_put(persistent_term_key(group_slug), posts)
-    safe_persistent_term_put(cache_generated_at_key(group_slug), generated_at)
+    # Only install this snapshot if nothing fresher landed while we were
+    # reading it. The query takes a database snapshot when it starts, so a
+    # slow read that began before a trash/unpublish committed carries the post
+    # as it was; writing that on top of the newer snapshot re-listed a post
+    # that had just been taken down, and warm reads never regenerate, so it
+    # stayed listed until the next mutation. `start_time` is the monotonic
+    # reading taken before the query, which is exactly the ordering to compare.
+    if stale_snapshot?(group_slug, start_time) do
+      Logger.debug("[ListingCache] Discarded a slower regeneration for #{group_slug}")
+    else
+      # Two puts, not three: the loaded-at and generated-at timestamps were always
+      # written with the SAME value, and each :persistent_term.put triggers a global
+      # GC pass — wasteful under autosave traffic. Store the timestamp once (L12).
+      safe_persistent_term_put(persistent_term_key(group_slug), posts)
+      safe_persistent_term_put(cache_generated_at_key(group_slug), {generated_at, start_time})
+    end
 
     elapsed = System.monotonic_time(:millisecond) - start_time
 
@@ -411,12 +431,33 @@ defmodule PhoenixKit.Modules.Publishing.ListingCache do
   @doc """
   Invalidates (clears) the cache for a group.
 
-  Clears the :persistent_term entries. The next read will trigger
-  a regeneration from the database.
+  Clears the :persistent_term entries locally AND broadcasts
+  `{:cache_invalidated, slug}` so every node's `CacheSync` erases its own
+  copy — `:persistent_term` is process-less, so a peer node's warm cache
+  never misses on its own and kept serving pre-mutation listings (rename/
+  trash/delete, category changes) until an unrelated local mutation. The
+  broadcast means ERASE, not regenerate (`:cache_changed`'s meaning): a
+  renamed-away slug can't be regenerated at all — its group lookup fails —
+  only erased. The next read on each node rebuilds lazily. PubSub is
+  at-most-once: a partitioned node misses the purge until its next local
+  mutation or restart — the listing cache is eventually consistent.
   """
   @spec invalidate(String.t()) :: :ok
   def invalidate(group_slug) do
-    # Clear :persistent_term entries
+    erase_local(group_slug)
+    PublishingPubSub.broadcast_cache_invalidated(group_slug)
+    Logger.debug("[ListingCache] Invalidated cache for #{group_slug}")
+    :ok
+  end
+
+  @doc """
+  Erases this node's :persistent_term entries for a group — no broadcast.
+
+  `CacheSync` calls this on `{:cache_invalidated, _}` receipt; calling
+  `invalidate/1` there would re-broadcast and storm the cluster.
+  """
+  @spec erase_local(String.t()) :: :ok
+  def erase_local(group_slug) do
     term_key = persistent_term_key(group_slug)
 
     try do
@@ -431,7 +472,6 @@ defmodule PhoenixKit.Modules.Publishing.ListingCache do
       ArgumentError -> :ok
     end
 
-    Logger.debug("[ListingCache] Invalidated cache for #{group_slug}")
     :ok
   end
 
@@ -440,7 +480,7 @@ defmodule PhoenixKit.Modules.Publishing.ListingCache do
 
   Used when memory caching is toggled off, so a later re-enable can't serve
   pre-disable data — `read/1` returns `:cache_miss` while disabled, but the stale
-  terms would otherwise still be present (under all three prefixes) the moment it's
+  terms would otherwise still be present (under both prefixes) the moment it's
   re-enabled. `:persistent_term` has no prefix-scan, so this filters the full term
   snapshot — fine for a rare admin toggle, never call it on a hot path.
   """
@@ -705,8 +745,22 @@ defmodule PhoenixKit.Modules.Publishing.ListingCache do
   @spec cache_generated_at(String.t()) :: String.t() | nil
   def cache_generated_at(group_slug) do
     case safe_persistent_term_get(cache_generated_at_key(group_slug)) do
+      # The entry carries the monotonic reading the regeneration started at
+      # alongside the timestamp, so a slower one can tell it has been overtaken.
+      # A bare string is what older entries hold.
+      {:ok, {generated_at, _started_at}} -> generated_at
       {:ok, generated_at} -> generated_at
       :not_found -> nil
+    end
+  end
+
+  # True when a regeneration that started later has already installed its
+  # snapshot. An entry with no reading (or none at all) can't be compared, so
+  # the write goes ahead — the pre-existing behaviour.
+  defp stale_snapshot?(group_slug, start_time) do
+    case safe_persistent_term_get(cache_generated_at_key(group_slug)) do
+      {:ok, {_generated_at, started_at}} when is_integer(started_at) -> started_at > start_time
+      _ -> false
     end
   end
 

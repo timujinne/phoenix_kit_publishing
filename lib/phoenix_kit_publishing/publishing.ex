@@ -447,7 +447,7 @@ defmodule PhoenixKit.Modules.Publishing do
   end
 
   @impl PhoenixKit.Module
-  def version, do: "0.4.4"
+  def version, do: "0.4.7"
 
   @impl PhoenixKit.Module
   def get_config do
@@ -455,6 +455,47 @@ defmodule PhoenixKit.Modules.Publishing do
       enabled: enabled?(),
       groups_count: length(list_groups())
     }
+  end
+
+  @doc """
+  Notification types this module contributes to the per-user preferences UI.
+
+  Without this the actions below still generate notifications, but a reader
+  has no way to turn them off — the preferences screen only lists registered
+  types. Publishing had neither: no type here, and no `target_uuid` on any
+  activity, so it produced no notifications at all.
+
+  Split into sub-types because the two differ in how personal they are: a
+  reply is addressed to you, while a comment on your post is closer to
+  ambient traffic and is the one a busy author mutes first.
+  """
+  @impl PhoenixKit.Module
+  def notification_types do
+    [
+      %{
+        key: "publishing",
+        label: "Publishing",
+        description: "Activity on posts you wrote",
+        actions: [],
+        default: true,
+        sub_types: [
+          %{
+            key: "comments",
+            label: "Comments on your posts",
+            description: "Someone commented on a post you wrote",
+            actions: ["publishing.comment.created"],
+            default: true
+          },
+          %{
+            key: "replies",
+            label: "Replies to your comments",
+            description: "Someone replied to a comment you left",
+            actions: ["publishing.comment.replied"],
+            default: true
+          }
+        ]
+      }
+    ]
   end
 
   @impl PhoenixKit.Module
@@ -566,6 +607,10 @@ defmodule PhoenixKit.Modules.Publishing do
       # Owns the ListingCache regeneration-lock ETS table so it outlives the
       # transient request processes that would otherwise create (and destroy) it.
       PhoenixKit.Modules.Publishing.ListingCache.LockTableOwner,
+      # Erases this node's cached listings when another node invalidates a
+      # group — without it, multi-node deploys served stale listings on peer
+      # nodes after a rename/trash/delete until an unrelated local mutation.
+      PhoenixKit.Modules.Publishing.ListingCache.CacheSync,
       # Per-post render cache (Renderer.render_post_cached/1). Without this the
       # cache GenServer never starts, so every published view re-renders markdown
       # and logs a per-request warning. max_size bounds growth — the cache key

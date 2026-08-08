@@ -9,12 +9,14 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor.Persistence do
   use Gettext, backend: PhoenixKitPublishing.Gettext
 
   alias PhoenixKit.Modules.Publishing
+  alias PhoenixKit.Modules.Publishing.Constants
   alias PhoenixKit.Modules.Publishing.DBStorage
   alias PhoenixKit.Modules.Publishing.Errors
   alias PhoenixKit.Modules.Publishing.ListingCache
   alias PhoenixKit.Modules.Publishing.PubSub, as: PublishingPubSub
   alias PhoenixKit.Modules.Publishing.Renderer
   alias PhoenixKit.Modules.Publishing.Shared
+  alias PhoenixKit.Modules.Publishing.Web.Editor.Collaborative
   alias PhoenixKit.Modules.Publishing.Web.Editor.Forms
   alias PhoenixKit.Modules.Publishing.Web.Editor.Helpers
 
@@ -33,31 +35,39 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor.Persistence do
     title = (socket.assigns.form["title"] || "") |> String.trim()
     slug = (socket.assigns.form["slug"] || "") |> String.trim()
 
+    # An autosave blocked by a missing title/slug used to return silently, so the
+    # writer kept typing behind an "Unsaved changes" badge while NOTHING was
+    # ever written. Flashing on every 500ms cycle would nag, so the reason is
+    # parked on the socket and the badge states it instead.
     cond do
       title == "" ->
-        if is_autosaving do
-          {:noreply, socket}
-        else
-          {:noreply,
-           Phoenix.LiveView.put_flash(socket, :warning, gettext("Title is required to save."))}
-        end
+        blocked(socket, is_autosaving, gettext("Title is required to save."))
 
       socket.assigns.group_mode == "slug" and slug == "" ->
-        if is_autosaving do
-          {:noreply, socket}
-        else
-          {:noreply,
-           Phoenix.LiveView.put_flash(
-             socket,
-             :warning,
-             gettext(
-               "Slug is required. Enter a title to auto-generate one, or type a slug manually."
-             )
-           )}
-        end
+        blocked(
+          socket,
+          is_autosaving,
+          gettext(
+            "Slug is required. Enter a title to auto-generate one, or type a slug manually."
+          )
+        )
 
       true ->
-        do_perform_save_with_params(socket)
+        socket
+        |> Phoenix.Component.assign(:autosave_blocked, nil)
+        |> do_perform_save_with_params()
+    end
+  end
+
+  # Autosave can't proceed: park the reason for the badge. A manual Save also
+  # flashes, because the writer just asked for it and deserves an answer.
+  defp blocked(socket, is_autosaving?, message) do
+    socket = Phoenix.Component.assign(socket, :autosave_blocked, message)
+
+    if is_autosaving? do
+      {:noreply, socket}
+    else
+      {:noreply, Phoenix.LiveView.put_flash(socket, :warning, message)}
     end
   end
 
@@ -70,6 +80,9 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor.Persistence do
         "slug",
         "featured_image_uuid",
         "featured",
+        "category_uuids",
+        "audio_uuid",
+        "allow_version_access",
         "url_slug",
         "title",
         "og_title",
@@ -77,6 +90,8 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor.Persistence do
         "og_image_uuid"
       ])
       |> Map.put("content", socket.assigns.content)
+
+    params = restore_default_url_slug(params, socket.assigns.post)
 
     params =
       case {socket.assigns.group_mode, Map.get(params, "slug")} do
@@ -104,16 +119,37 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor.Persistence do
         # Don't silently clear or save — show the user which post owns the slug
         # (with a link) so they can rename theirs or jump to the other one. The
         # form keeps their typed slug so they can edit it after closing.
+        #
+        # `autosave_blocked` also parks the reason: the changes stay pending, so
+        # without this every subsequent keystroke rescheduled autosave, which
+        # re-hit this branch and re-opened the modal the writer had just closed.
         {:noreply,
          socket
          |> Phoenix.Component.assign(:slug_conflict_info, info)
-         |> Phoenix.Component.assign(:show_slug_conflict_modal, true)}
+         |> Phoenix.Component.assign(:show_slug_conflict_modal, true)
+         |> Phoenix.Component.assign(
+           :autosave_blocked,
+           gettext("That slug is taken — pick another to save.")
+         )}
 
       {:error, reason} ->
         error_message = url_slug_error_message(reason)
         {:noreply, Phoenix.LiveView.put_flash(socket, :error, error_message)}
     end
   end
+
+  # The UI promises "leave empty to restore the default slug", but the
+  # domain layer deliberately reads a blank url_slug as "leave it alone"
+  # (protecting programmatic partial maps — see upsert_post_content).
+  # Translate the promise here: an erased field becomes an EXPLICIT write of
+  # the post's default slug, which also files the old custom slug as a 301.
+  # Timestamp posts have no slug to restore — leave blank alone.
+  defp restore_default_url_slug(%{"url_slug" => ""} = params, %{slug: default_slug})
+       when is_binary(default_slug) and default_slug != "" do
+    Map.put(params, "url_slug", default_slug)
+  end
+
+  defp restore_default_url_slug(params, _post), do: params
 
   defp validate_url_slug_for_save(socket, params) do
     url_slug = Map.get(params, "url_slug", "")
@@ -377,7 +413,7 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor.Persistence do
             Map.get(new_version_post, :version_dates, %{})
           )
           |> Phoenix.Component.assign(:editing_published_version, false)
-          |> Phoenix.Component.assign(:has_pending_changes, false)
+          |> Helpers.mark_clean()
           |> Phoenix.LiveView.push_event("changes-status", %{has_changes: false})
           |> Phoenix.LiveView.put_flash(
             :info,
@@ -442,8 +478,8 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor.Persistence do
 
   # All languages are equal — status is version-level, no per-language enforcement needed
   defp should_publish_version?(new_status, current_status, current_version) do
-    new_status == "published" and
-      current_status != "published" and
+    Constants.published?(new_status) and
+      not Constants.published?(current_status) and
       current_version != nil
   end
 
@@ -458,7 +494,29 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor.Persistence do
          _post,
          _version
        ) do
-    handle_post_save_success(socket, updated_post)
+    requested_status = socket.assigns.form["status"]
+    saved_status = get_in(updated_post, [:metadata, :status])
+
+    {:noreply, socket} = handle_post_save_success(socket, updated_post)
+
+    # The domain deliberately drops a draft/archived status on the LIVE
+    # version (unpublishing is unpublish_post's job) — but the editor
+    # offered the select, saved, flashed success, and snapped the select
+    # back with no explanation. Say what actually happened.
+    socket =
+      if requested_status != saved_status and Constants.published?(saved_status) do
+        Phoenix.LiveView.put_flash(
+          socket,
+          :info,
+          gettext(
+            "The live version stays published — to take it offline, use Unpublish on the group page."
+          )
+        )
+      else
+        socket
+      end
+
+    {:noreply, socket}
   end
 
   defp handle_successful_update(
@@ -482,13 +540,29 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor.Persistence do
         handle_post_save_success(socket, updated_post)
 
       {:error, reason} ->
+        # The content DID save (update_post committed before this publish
+        # attempt) — mark the buffer clean so language/version switches
+        # aren't blocked by flush_before_switch endlessly re-hitting the
+        # same publish failure. And name the actual reason: the old
+        # unconditional "archiving the other versions failed" wording sent
+        # a blank-primary-title user (:title_required) hunting a phantom
+        # archiving problem.
+        message =
+          case reason do
+            :title_required ->
+              gettext(
+                "Post saved as a draft, but it can't be published: the primary language needs a title."
+              )
+
+            _ ->
+              gettext("Post saved, but publishing failed.") <> " " <> Errors.message(reason)
+          end
+
         {:noreply,
-         Phoenix.LiveView.put_flash(
-           socket,
-           :warning,
-           gettext("Post saved, but archiving the other versions failed.") <>
-             " " <> Errors.message(reason)
-         )}
+         socket
+         |> Helpers.mark_clean()
+         |> Phoenix.LiveView.push_event("changes-status", %{has_changes: false})
+         |> Phoenix.LiveView.put_flash(:warning, message)}
     end
   end
 
@@ -504,8 +578,19 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor.Persistence do
           "form_key=#{inspect(socket.assigns.form_key)}, source=#{inspect(socket.id)}"
       )
 
-      PublishingPubSub.broadcast_editor_saved(socket.assigns.form_key, socket.id)
+      PublishingPubSub.broadcast_editor_saved(
+        socket.assigns.form_key,
+        socket.id,
+        {socket.assigns.group_slug, get_in(socket.assigns, [:post, :uuid])}
+      )
     end
+
+    # A save that WORKS must retract a previous failure. update_meta now
+    # deliberately preserves :error across keystrokes (so an autosave failure
+    # isn't wiped by the next character), which means nothing else would ever
+    # clear it: the writer would see red "Autosave failed" and green "Post
+    # saved" side by side, indefinitely.
+    socket = Phoenix.LiveView.clear_flash(socket, :error)
 
     flash_message =
       if socket.assigns.is_autosaving,
@@ -535,7 +620,7 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor.Persistence do
 
     form = Forms.post_form_with_primary_status(group_slug, refreshed_post, current_version)
 
-    is_published = form["status"] == "published"
+    is_published = Constants.published?(form["status"])
 
     # Update saved_status to reflect the newly saved status
     new_saved_status = form["status"]
@@ -545,7 +630,7 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor.Persistence do
       |> Phoenix.Component.assign(:post, refreshed_post)
       |> Forms.assign_form_with_tracking(form)
       |> Phoenix.Component.assign(:content, refreshed_post.content)
-      |> Phoenix.Component.assign(:has_pending_changes, false)
+      |> Helpers.mark_clean()
       |> Phoenix.Component.assign(:editing_published_version, is_published)
       |> Phoenix.Component.assign(:saved_status, new_saved_status)
       |> Phoenix.Component.assign(:language_statuses, refreshed_post.language_statuses)
@@ -606,7 +691,11 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor.Persistence do
               "form_key=#{inspect(socket.assigns.form_key)}, source=#{inspect(socket.id)}"
           )
 
-          PublishingPubSub.broadcast_editor_saved(socket.assigns.form_key, socket.id)
+          PublishingPubSub.broadcast_editor_saved(
+            socket.assigns.form_key,
+            socket.id,
+            {socket.assigns.group_slug, get_in(socket.assigns, [:post, :uuid])}
+          )
         end
 
         flash_message =
@@ -626,7 +715,7 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor.Persistence do
           |> Forms.assign_form_with_tracking(form)
           |> Phoenix.Component.assign(:content, updated_post.content)
           |> Phoenix.Component.assign(:available_languages, updated_post.available_languages)
-          |> Phoenix.Component.assign(:has_pending_changes, false)
+          |> Helpers.mark_clean()
           |> Phoenix.Component.assign(extra_assigns)
           |> Phoenix.LiveView.push_event("changes-status", %{has_changes: false})
           |> Phoenix.LiveView.push_patch(
@@ -814,7 +903,7 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor.Persistence do
         |> Forms.assign_form_with_tracking(form)
         |> Phoenix.Component.assign(:content, updated_post.content)
         |> Phoenix.Component.assign(:available_languages, updated_post.available_languages)
-        |> Phoenix.Component.assign(:has_pending_changes, false)
+        |> Helpers.mark_clean()
         |> Phoenix.LiveView.push_event("changes-status", %{has_changes: false})
         |> Phoenix.LiveView.push_event("set-content", %{content: updated_post.content})
         |> Phoenix.LiveView.put_flash(flash_level, flash_msg)
@@ -846,8 +935,32 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor.Persistence do
 
   @doc """
   Reload post when another tab/user saves (last-save-wins).
+
+  Unless this socket is holding work of its own. Two tabs open on the same
+  post are both owners when they belong to the same account — presence keys
+  on the user, not the socket — so saving in one told the other to reload,
+  and the reload overwrote whatever had been typed in the meantime and marked
+  it clean. Nothing warned, and there was nothing left to recover from.
+
+  A tab with unsaved changes keeps them and is told the row moved underneath
+  it, which is a conflict a person can resolve; the tab that has nothing
+  pending still reloads, which is what makes a reference tab follow along.
   """
   def reload_post(socket) do
+    if socket.assigns[:has_pending_changes] do
+      Phoenix.LiveView.put_flash(
+        socket,
+        :warning,
+        gettext(
+          "This post was saved somewhere else. Your unsaved changes are still here — saving will overwrite that copy."
+        )
+      )
+    else
+      do_reload_post(socket)
+    end
+  end
+
+  defp do_reload_post(socket) do
     group_slug = socket.assigns.group_slug
     current_language = socket.assigns[:current_language]
     current_version = socket.assigns[:current_version]
@@ -861,7 +974,10 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor.Persistence do
         |> Forms.assign_form_with_tracking(form)
         |> Phoenix.Component.assign(:content, updated_post.content)
         |> Phoenix.Component.assign(:available_languages, updated_post.available_languages)
-        |> Phoenix.Component.assign(:has_pending_changes, false)
+        |> Helpers.mark_clean()
+        # This socket now matches the row again, so a later promotion should
+        # take the saved copy rather than re-adopting what it mirrored before.
+        |> Collaborative.clear_synced_from_owner()
         |> Phoenix.LiveView.push_event("changes-status", %{has_changes: false})
         |> Phoenix.LiveView.push_event("set-content", %{content: updated_post.content})
         |> Phoenix.LiveView.put_flash(:info, gettext("Post updated by another user"))

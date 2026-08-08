@@ -10,10 +10,12 @@ defmodule PhoenixKit.Modules.Publishing.DBStorage.Mapper do
   - **Content** — per-language: title, body, url_slug (for routing)
   """
 
+  alias PhoenixKit.Modules.Publishing.Constants
   alias PhoenixKit.Modules.Publishing.LanguageHelpers
   alias PhoenixKit.Modules.Publishing.PublishingContent
   alias PhoenixKit.Modules.Publishing.PublishingPost
   alias PhoenixKit.Modules.Publishing.PublishingVersion
+  alias PhoenixKit.Modules.Publishing.Shared
   alias PhoenixKit.Utils.Values
 
   @doc """
@@ -78,6 +80,7 @@ defmodule PhoenixKit.Modules.Publishing.DBStorage.Mapper do
       content_updated_at: content.updated_at,
       metadata: build_metadata(post, version, content, effective_status, effective_published_at)
     }
+    |> maybe_override_title(opts)
   end
 
   @doc """
@@ -144,6 +147,7 @@ defmodule PhoenixKit.Modules.Publishing.DBStorage.Mapper do
       language_titles: Map.new(all_contents, fn c -> {c.language, c.title} end),
       language_excerpts: Map.new(all_contents, fn c -> {c.language, extract_excerpt(c)} end)
     }
+    |> maybe_override_title(opts)
   end
 
   # ===========================================================================
@@ -160,6 +164,28 @@ defmodule PhoenixKit.Modules.Publishing.DBStorage.Mapper do
      Keyword.get(opts, :effective_published_at) || published_at}
   end
 
+  # The admin listing's live-title override (see the caller in DBStorage):
+  # applied AFTER the map is built so the per-language/per-version maps stay
+  # version-accurate — only the card-level metadata.title follows the live
+  # version. A no-op when the opt is absent (every non-admin path).
+  defp maybe_override_title(map, opts) do
+    map =
+      case Keyword.get(opts, :effective_title) do
+        title when is_binary(title) and title != "" ->
+          put_in(map, [:metadata, :title], title)
+
+        _ ->
+          map
+      end
+
+    # Present only for published posts: the version number the admin card's
+    # edit links pin (published → open the live version; drafts → newest).
+    case Keyword.get(opts, :effective_live_version) do
+      n when is_integer(n) -> Map.put(map, :live_version, n)
+      _ -> map
+    end
+  end
+
   defp get_group_slug(%PublishingPost{group: %{slug: slug}}), do: slug
   defp get_group_slug(%PublishingPost{} = _post), do: nil
 
@@ -169,7 +195,7 @@ defmodule PhoenixKit.Modules.Publishing.DBStorage.Mapper do
     active_uuid = Map.get(post, :active_version_uuid)
 
     if not is_nil(active_uuid) and active_uuid == version_uuid do
-      "published"
+      Constants.status_published()
     else
       version.status
     end
@@ -178,7 +204,12 @@ defmodule PhoenixKit.Modules.Publishing.DBStorage.Mapper do
   defp build_metadata(post, version, content, status, published_at) do
     %{
       title: content.title,
-      description: PublishingVersion.get_description(version),
+      # Version wins (a stored "" is an explicit cleared value); only an
+      # ABSENT version key falls back to the row's V1-legacy per-language
+      # value — see legacy_content_fallback/2.
+      description:
+        PublishingVersion.get_description(version) ||
+          legacy_content_fallback(content, "description"),
       status: status,
       slug: post.slug,
       version: version.version_number,
@@ -186,9 +217,13 @@ defmodule PhoenixKit.Modules.Publishing.DBStorage.Mapper do
       url_slug: content.url_slug,
       previous_url_slugs: PublishingContent.get_previous_url_slugs(content),
       published_at: format_datetime(published_at),
-      featured_image_uuid: PublishingVersion.get_featured_image_uuid(version),
+      featured_image_uuid:
+        PublishingVersion.get_featured_image_uuid(version) ||
+          legacy_content_fallback(content, "featured_image_uuid"),
       featured: PublishingVersion.get_featured(version),
       tags: PublishingVersion.get_tags(version),
+      category_uuids: PublishingVersion.get_category_uuids(version),
+      audio_uuid: PublishingVersion.get_audio_uuid(version),
       og: PublishingContent.get_og(content)
     }
   end
@@ -203,7 +238,8 @@ defmodule PhoenixKit.Modules.Publishing.DBStorage.Mapper do
       allow_version_access: false,
       published_at: nil,
       featured_image_uuid: nil,
-      featured: false
+      featured: false,
+      category_uuids: []
     }
   end
 
@@ -218,21 +254,31 @@ defmodule PhoenixKit.Modules.Publishing.DBStorage.Mapper do
       allow_version_access: PublishingVersion.get_allow_version_access(version),
       published_at: format_datetime(published_at),
       featured_image_uuid: PublishingVersion.get_featured_image_uuid(version),
-      featured: PublishingVersion.get_featured(version)
+      featured: PublishingVersion.get_featured(version),
+      tags: PublishingVersion.get_tags(version),
+      category_uuids: PublishingVersion.get_category_uuids(version),
+      audio_uuid: PublishingVersion.get_audio_uuid(version)
     }
   end
 
   defp build_listing_metadata(post, version, content, status, published_at) do
     %{
       title: content.title,
-      description: PublishingVersion.get_description(version),
+      description:
+        PublishingVersion.get_description(version) ||
+          legacy_content_fallback(content, "description"),
       status: status,
       slug: post.slug,
       # Must mirror build_metadata/5 — see the clause above.
       allow_version_access: PublishingVersion.get_allow_version_access(version),
       published_at: format_datetime(published_at),
-      featured_image_uuid: PublishingVersion.get_featured_image_uuid(version),
-      featured: PublishingVersion.get_featured(version)
+      featured_image_uuid:
+        PublishingVersion.get_featured_image_uuid(version) ||
+          legacy_content_fallback(content, "featured_image_uuid"),
+      featured: PublishingVersion.get_featured(version),
+      tags: PublishingVersion.get_tags(version),
+      category_uuids: PublishingVersion.get_category_uuids(version),
+      audio_uuid: PublishingVersion.get_audio_uuid(version)
     }
   end
 
@@ -247,6 +293,24 @@ defmodule PhoenixKit.Modules.Publishing.DBStorage.Mapper do
       {c.language, PublishingContent.get_previous_url_slugs(c)}
     end)
   end
+
+  # V1 stored description/featured_image_uuid per-language on content.data;
+  # V2's home is version.data, migrated by promotion-on-first-edit
+  # (Posts.collect_legacy_content_promotions/2). A never-edited V1 post lost
+  # its featured image and explicit description on every public surface
+  # until someone happened to edit it — this read-side fallback restores
+  # them, per-language-faithfully (the rendered language's own value), and
+  # goes dead for a row the moment promotion runs (the version key then
+  # exists, and a stored "" is an explicit cleared value that wins). Same
+  # pattern extract_excerpt/1 below has always used for card excerpts.
+  defp legacy_content_fallback(%PublishingContent{data: data}, key) when is_map(data) do
+    case Map.get(data, key) do
+      value when is_binary(value) and value != "" -> value
+      _ -> nil
+    end
+  end
+
+  defp legacy_content_fallback(_content, _key), do: nil
 
   defp extract_excerpt(%PublishingContent{} = content) do
     case PublishingContent.get_excerpt(content) do
@@ -268,12 +332,18 @@ defmodule PhoenixKit.Modules.Publishing.DBStorage.Mapper do
 
   defp extract_first_paragraph(content) when is_binary(content) do
     content
+    # Components first: a body opening with <Gallery>/<Showcase> would
+    # otherwise become the "first paragraph", and the 300-char slice below
+    # could cut MID-TAG — the broken tag then survives downstream
+    # tag-stripping as escaped junk in the card preview.
+    |> Shared.strip_components()
     |> String.split(~r/\n\n+/)
-    |> Enum.reject(&String.starts_with?(&1, "#"))
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == "" or String.starts_with?(&1, "#")))
     |> List.first()
     |> case do
       nil -> ""
-      text -> text |> String.trim() |> String.slice(0, 300)
+      text -> String.slice(text, 0, 300)
     end
   end
 
@@ -287,7 +357,7 @@ defmodule PhoenixKit.Modules.Publishing.DBStorage.Mapper do
 
   defp merge_published_statuses(latest_statuses, published_statuses) do
     Map.merge(latest_statuses, published_statuses, fn _lang, latest, published ->
-      if published == "published", do: "published", else: latest
+      if Constants.published?(published), do: Constants.status_published(), else: latest
     end)
   end
 
