@@ -106,7 +106,13 @@ the "name taken" check in `ensure/4`) do not look at the storage library
 the module's, or push a group onto its fallback name. Publishing does its own
 lookups in Media, oldest first — the module folder, a group's folder by host
 or deterministic name, a group's or the module's pointer — and asks `ensure/4`
-only to create; new folders go to Media (the column default).
+only to create; new folders go to Media (the column default). The lookup, the
+name choice, the create and the pointer write run in one transaction under
+the `{parent, host name}` and `{parent, deterministic name}` advisory locks
+(`ResourceFolders.lock_name/2`, the ones core's `ensure/4` and the
+reorganizer's pointer back-fill take), so two same-named groups — group names
+are not unique — never share a folder; a host name core refuses (taken, too
+long) falls back to the deterministic one.
 
 ## Baked URLs
 

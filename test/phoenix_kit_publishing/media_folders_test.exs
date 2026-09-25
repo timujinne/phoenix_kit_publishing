@@ -7,6 +7,7 @@ defmodule PhoenixKit.Modules.Publishing.MediaFoldersTest do
   alias PhoenixKit.Modules.Storage
   alias PhoenixKit.Modules.Storage.Folder
   alias PhoenixKit.Modules.Storage.Libraries
+  alias PhoenixKit.Modules.Storage.ResourceFolders
   alias PhoenixKitPublishing.Test.MediaHooks, as: Hooks
 
   @app :phoenix_kit_publishing
@@ -162,6 +163,39 @@ defmodule PhoenixKit.Modules.Publishing.MediaFoldersTest do
       assert folder.uuid != theirs.uuid
       assert to_string(folder.library_uuid) == Libraries.media_uuid()
       assert reload(group).data["media_folder_uuid"] == folder.uuid
+    end
+
+    test "a host name core refuses (too long) falls back to the deterministic name" do
+      Application.put_env(@app, :attachments_parent_folder, {Hooks, :root})
+      Application.put_env(@app, :attachments_folder_name, {Hooks, :too_long})
+      group = group!("News")
+
+      assert {:ok, %Folder{name: name}} = MediaFolders.ensure_group_folder(group, nil)
+      assert name == "publishing-group-" <> group.uuid
+      assert reload(group).data["media_folder_uuid"] != nil
+    end
+
+    test "every claimant of a host name queues on core's {parent, name} lock" do
+      Application.put_env(@app, :attachments_parent_folder, {Hooks, :root})
+      Application.put_env(@app, :attachments_folder_name, {Hooks, :news})
+      group = group!("News")
+
+      # A second connection holds the lock core's ensure/4 and the
+      # reorganizer's back-fill take for "News" at the root.
+      {:ok, other} =
+        Repo.config()
+        |> Keyword.take([:hostname, :port, :username, :password, :database])
+        |> Postgrex.start_link()
+
+      key = ResourceFolders.name_lock_key(nil, "News")
+      Postgrex.query!(other, "SELECT pg_advisory_lock(hashtext($1))", [key])
+
+      task = Task.async(fn -> MediaFolders.ensure_group_folder(group, nil) end)
+      assert Task.yield(task, 300) == nil
+
+      Postgrex.query!(other, "SELECT pg_advisory_unlock(hashtext($1))", [key])
+      assert {:ok, {:ok, %Folder{name: "News"}}} = Task.yield(task, 5_000)
+      GenServer.stop(other)
     end
 
     test "strict: a raising parent hook is an error and creates nothing" do

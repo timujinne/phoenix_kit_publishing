@@ -178,10 +178,13 @@ defmodule PhoenixKit.Modules.Publishing.MediaFolders do
   # ── Group folders ──────────────────────────────────────────────────
 
   @doc """
-  The group's folder, found or created under the parent hook's answer, the
-  group's pointer written in the same locked step. A host name taken by
-  another group's folder falls back to the deterministic name. Only folders
-  of the site's media library (Media) are ever adopted.
+  The group's folder, found or created under the parent hook's answer, and
+  the group's pointer written — lookup, name choice, create and pointer in
+  one transaction, under the `{parent, name}` locks core's `ensure/4` and
+  the reorganizer's back-fill take. A host name taken by another group's
+  folder, or refused by core (e.g. too long), falls back to the
+  deterministic name. Only folders of the site's media library (Media) are
+  ever adopted.
 
   A failing hook falls back to the media root and the deterministic name,
   logged — an upload never fails on a host hook. With `strict: true` (the
@@ -209,22 +212,81 @@ defmodule PhoenixKit.Modules.Publishing.MediaFolders do
   # name taken" check inside `ensure/4`) do not look at the library and
   # take the first row without an order, so at the root — a hook that
   # answers `nil` — a person's private `News` could be adopted or could push
-  # the group onto its fallback name. The lookup and the name choice are
-  # therefore made here, in Media, oldest first; `ensure/4` is only asked to
-  # create (race-safe, claimed under its lock).
+  # the group onto its fallback name. The lookup, the name choice and the
+  # claim are therefore made here, in Media, oldest first, in ONE
+  # transaction under the name locks core's own `ensure/4` and the
+  # reorganizer's pointer back-fill take: `{parent, host name}` — so every
+  # group claiming the same host name (group names are not unique) queues
+  # on it — and `{parent, deterministic name}`. `ensure/4` is only asked to
+  # create; a name core refuses (taken, too long) falls back to the
+  # deterministic one, which cannot collide.
   defp create_group_folder(group, parent_uuid, host_name, actor_uuid) do
     deterministic = deterministic_name(group)
-    lookup = fn -> find_group_folder(group, parent_uuid, host_name, deterministic) end
+    host = if host_name != deterministic, do: host_name
+    lookup = fn -> find_group_folder(group, parent_uuid, host, deterministic) end
 
-    name =
-      if is_binary(host_name) and media_folder_named(host_name, parent_uuid),
-        do: deterministic,
-        else: host_name || deterministic
+    safely(fn ->
+      transact(fn ->
+        claim_folder(group, lookup, host, deterministic, parent_uuid, actor_uuid)
+      end)
+    end)
+  end
 
-    ResourceFolders.ensure(name, parent_uuid, actor_uuid,
-      lookup: lookup,
-      claim: &ResourceFolders.write_pointer(PublishingGroup, group.uuid, @pointer, &1.uuid)
-    )
+  # `fun`'s `{:ok, value}` commits, its `{:error, reason}` rolls back.
+  defp transact(fun) do
+    repo().transaction(fn ->
+      case fun.() do
+        {:ok, value} -> value
+        {:error, reason} -> repo().rollback(reason)
+      end
+    end)
+  end
+
+  defp claim_folder(group, lookup, host, deterministic, parent_uuid, actor_uuid) do
+    if host, do: ResourceFolders.lock_name(parent_uuid, host)
+    ResourceFolders.lock_name(parent_uuid, deterministic)
+
+    with {:ok, folder} <- find_or_create(lookup, host, deterministic, parent_uuid, actor_uuid),
+         :ok <- ResourceFolders.write_pointer(PublishingGroup, group.uuid, @pointer, folder.uuid) do
+      {:ok, folder}
+    end
+  end
+
+  defp find_or_create(lookup, host, deterministic, parent_uuid, actor_uuid) do
+    case lookup.() do
+      %Folder{} = folder ->
+        {:ok, folder}
+
+      nil ->
+        # Under the host-name lock, a live Media folder of that name that the
+        # lookup did not adopt belongs to another group.
+        name =
+          if host && is_nil(media_folder_named(host, parent_uuid)), do: host, else: deterministic
+
+        create(name, deterministic, parent_uuid, actor_uuid, lookup)
+    end
+  end
+
+  # `ensure/4` inserts under a savepoint inside a transaction, so a refused
+  # name leaves this transaction usable for the deterministic retry.
+  defp create(name, deterministic, parent_uuid, actor_uuid, lookup) do
+    case ResourceFolders.ensure(name, parent_uuid, actor_uuid, lookup: lookup) do
+      {:error, %Ecto.Changeset{errors: errors}} = error when name != deterministic ->
+        if Keyword.has_key?(errors, :name),
+          do: ResourceFolders.ensure(deterministic, parent_uuid, actor_uuid, lookup: lookup),
+          else: error
+
+      result ->
+        result
+    end
+  end
+
+  defp safely(fun) do
+    fun.()
+  rescue
+    error -> {:error, error}
+  catch
+    :exit, reason -> {:error, {:exit, reason}}
   end
 
   # `ResourceFolders.resolve/1`'s order, in Media only: the host name

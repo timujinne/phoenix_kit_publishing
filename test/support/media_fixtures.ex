@@ -133,9 +133,10 @@ defmodule PhoenixKitPublishing.Test.MediaFixtures do
 end
 
 defmodule PhoenixKitPublishing.Test.MediaHooks do
-  @moduledoc "Host hooks for the media-folder tests: a root answer, a broken one, a fixed name."
+  @moduledoc "Host hooks for the media-folder tests: a root answer, a broken one, fixed names."
 
   def root(_kind, _actor_uuid, _group), do: nil
   def boom(_kind, _actor_uuid, _group), do: raise("hook bug")
   def news(_group, _actor_uuid), do: {:ok, "News"}
+  def too_long(_group, _actor_uuid), do: {:ok, String.duplicate("N", 300)}
 end
