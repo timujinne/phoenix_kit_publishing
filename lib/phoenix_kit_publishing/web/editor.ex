@@ -2800,7 +2800,13 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor do
   # Core's task supervisor, as the view counter uses it; a host without one
   # running is an exit (noproc), and the filing then runs in place.
   defp start_filing(file) do
-    Task.Supervisor.start_child(PhoenixKit.TaskSupervisor, file)
+    case Task.Supervisor.start_child(PhoenixKit.TaskSupervisor, file) do
+      {:ok, _pid} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("[Publishing] picked media not filed, no task started: #{inspect(reason)}")
+    end
   catch
     :exit, _reason -> file.()
   end
