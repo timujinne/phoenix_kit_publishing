@@ -12,7 +12,7 @@ defmodule PhoenixKitPublishing.CorePinConformanceTest do
   outright, with no degraded mode. Nothing else in this repo's own test run
   would notice, which is why the check is a test rather than a convention.
 
-  What this does NOT forbid is raising the two-segment FLOOR. `~> 2.14` still
+  What this does NOT forbid is raising the two-segment FLOOR. `~> 2.38` still
   admits every later 2.x, and the floor has to track the oldest core that has
   every function this module calls, BEHAVING as this module needs it to:
 
