@@ -37,6 +37,10 @@ defmodule PhoenixKit.Modules.Publishing.FacadeCallbacksTest do
       assert Publishing.migration_module() == PhoenixKitPublishing.Migrations
     end
 
+    test "media_reorganizer registers the group-folder source with core's reorganizer" do
+      assert Publishing.media_reorganizer() == PhoenixKit.Modules.Publishing.MediaReorganizer
+    end
+
     test "children returns Presence in the supervision child list" do
       children = Publishing.children()
       assert PhoenixKit.Modules.Publishing.Presence in children

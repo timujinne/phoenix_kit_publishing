@@ -672,6 +672,11 @@ defmodule PhoenixKit.Modules.Publishing do
   @impl PhoenixKit.Module
   def migration_module, do: PhoenixKitPublishing.Migrations
 
+  # The group media folders' plan source for `mix phoenix_kit.media.reorganize`
+  # (see `MediaFolders` for the host config that turns the folders on).
+  @impl PhoenixKit.Module
+  def media_reorganizer, do: PhoenixKit.Modules.Publishing.MediaReorganizer
+
   # ============================================================================
   # Shared Helpers (used across submodules)
   # ============================================================================
