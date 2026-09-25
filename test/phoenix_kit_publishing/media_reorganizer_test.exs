@@ -37,11 +37,29 @@ defmodule PhoenixKit.Modules.Publishing.MediaReorganizerTest do
     updated
   end
 
-  test "a host without hooks is only ever reported on" do
-    group = group!("News")
-    point(group, folder!("News"))
+  test "a host without hooks is only ever reported on, and nothing moves" do
+    news = group!("News")
+    news_folder = folder!("News")
+    point(news, news_folder)
+    legal = group!("Legal")
+    legacy = folder!("publishing-group-" <> legal.uuid)
+    old = group!("Old", %{status: "trashed"})
+    orphan = folder!("publishing-group-" <> old.uuid)
 
-    assert Enum.all?(run(), &(&1.op == :report))
+    planned = run()
+
+    # Something is planned — the orphan — so "all reports" is not vacuous.
+    assert [%{op: :report, kind: :orphan, folder: %{uuid: orphan_uuid}}] = planned
+    assert orphan_uuid == orphan.uuid
+
+    run(apply?: true)
+
+    for folder <- [news_folder, legacy, orphan] do
+      assert Map.take(reload(folder), [:name, :parent_uuid, :trashed_at]) ==
+               Map.take(folder, [:name, :parent_uuid, :trashed_at])
+    end
+
+    assert reload(legal).data["media_folder_uuid"] == nil
   end
 
   test "moves a group's folder under the parent the hook now answers" do
@@ -82,6 +100,20 @@ defmodule PhoenixKit.Modules.Publishing.MediaReorganizerTest do
 
     assert Enum.any?(actions, &(&1.op == :report and &1.kind == :orphan))
     assert reload(orphan).parent_uuid == nil
+  end
+
+  test "a trashed group's host-named folder is reported once, through its pointer" do
+    configure_default_hooks()
+    group = group!("News")
+    {:ok, folder} = MediaFolders.ensure_group_folder(group, nil)
+    file!(%{folder_uuid: folder.uuid})
+    {:ok, _} = DBStorage.trash_group(reload(group))
+
+    assert [%{op: :report, kind: :orphan, label: "News", counts: {1, 0}, reason: reason}] =
+             run(apply?: true)
+
+    assert reason =~ "trashed"
+    assert reload(folder).trashed_at == nil
   end
 
   test "reports a group whose posts use files outside its folder" do
