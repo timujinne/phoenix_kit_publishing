@@ -66,23 +66,39 @@ library, is reported and left alone.
 
 1. **Existing files, once** — `MediaAdoption.run(actor_uuid, apply?: false)`
    (`mix phoenix_kit_publishing.media.adopt [--apply]`). Dry run by default,
-   writes nothing and calls no hook; `--apply` finds-or-creates each group's
-   folder (only for groups that have files to file) and attaches.
+   writes nothing and calls no hook, but refuses when a configured hook is not
+   callable; `--apply` finds-or-creates each group's folder (only for groups
+   that have files to file) with the hooks called strictly — a failing hook
+   leaves that group unfiled, never filed at the media root — and attaches.
    Core's `Reorganizer` cannot do this step: it moves existing *folders* and by
    contract never creates folders nor touches files, and publishing had no
    folders at all. The step reuses core's `ResourceFolders.ensure/4` and
    `attach/2` rather than writing rows itself; re-running it is a no-op.
 2. **New files** — the editor files every file chosen in the media picker
    (featured / OG / audio slot, Image / Gallery / Audio component) into the
-   post's group folder right after the choice lands. The picker itself stays
-   unscoped: people still browse the whole library.
+   post's group folder right after the choice lands, in a task under
+   `PhoenixKit.TaskSupervisor` (a gallery is one transaction per image). A
+   trashed group and system-managed files are skipped, as in step 1. The
+   picker itself stays unscoped: people still browse the whole library.
 3. **Later changes of the tree** — `media_reorganizer/0` registers
    `MediaReorganizer` (core's `ResourceSource`, kind `:group`) with
    `mix phoenix_kit.media.reorganize`: when a host changes its hooks, the group
    folders move under the new parent (pointer back-fill for a folder found by
-   its deterministic name), orphans of trashed/deleted groups are reported. Its
-   `extra` report (`:unfiled`) lists groups whose files are still outside their
-   folder, so the core dry run tells the host when step 1 is needed.
+   its deterministic name). Orphans: core's scan reports a deterministic-named
+   folder of a trashed or deleted group (at the root or under a parent a hook
+   named); a host-named one (`News`) of a trashed group is reported by
+   publishing's own `extra`, through the pointer. A hard-deleted group's
+   host-named folder cannot be traced (its pointer went with the row). The
+   other `extra` report (`:unfiled`) lists groups whose files are still outside
+   their folder, so the core dry run tells the host when step 1 is needed.
+
+## Libraries
+
+Core's by-name folder lookups (`ResourceFolders.find_under/2`, `resolve/1`)
+do not look at the storage library (V202/V203), so a `Publishing` or `News`
+folder at the root of a person's private library could be taken for the
+module's. Publishing looks the module folder up in Media only and never adopts
+a group folder outside Media; new folders go to Media (the column default).
 
 ## Baked URLs
 

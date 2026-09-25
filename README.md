@@ -415,7 +415,23 @@ lives in another folder stays there and is linked in. File URLs do not change.
 From then on every file picked in the post editor lands in the group's folder
 by itself, and `mix phoenix_kit.media.reorganize` moves the group folders when
 you change the hooks later (it also reports a group whose files are outside its
-folder).
+folder, and the folder of a trashed group).
+
+Folders are only ever looked up and created in the site's media library
+(Media), never in a person's own library. If a configured hook cannot be
+called, the adoption step refuses to plan; if one fails while applying, that
+group is left unfiled rather than filed at the media root.
+
+> #### Trashing a group's folder trashes the posts' pictures {: .warning}
+>
+> After adoption, a file that used to have no folder lives in its group's
+> folder. Moving `Publishing/<group>` (or `Publishing` itself) to the trash in
+> the media browser trashes every file whose home is inside it — including one
+> that is also shown somewhere else by URL (a page, another module) — and those
+> pictures stop showing until the folder is restored from the trash. A file
+> that is only *linked* into the folder keeps its own home and is not affected.
+> Rename or move these folders freely; trash them only together with their
+> group.
 
 ## Removing this module
 
