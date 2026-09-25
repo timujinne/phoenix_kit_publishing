@@ -253,7 +253,13 @@ defmodule PhoenixKit.Modules.Publishing.MediaAdoption do
         _ ->
           uuids = Enum.map(pointers, &elem(&1, 1))
 
-          from(f in Folder, where: f.uuid in ^uuids and is_nil(f.trashed_at))
+          # A pointer at a folder outside Media is not the group's folder:
+          # applying files into a new one in Media (`ensure_group_folder/3`
+          # ignores it the same way).
+          from(f in Folder,
+            where: f.uuid in ^uuids and is_nil(f.trashed_at),
+            where: f.library_uuid == ^Libraries.media_uuid()
+          )
           |> repo().all()
           |> Map.new(&{&1.uuid, &1})
       end

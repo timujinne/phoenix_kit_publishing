@@ -139,16 +139,29 @@ defmodule PhoenixKit.Modules.Publishing.MediaFoldersTest do
   end
 
   describe "ensure_group_folder/3 and failing or unusual hooks" do
-    test "does not adopt a same-named folder of another library" do
+    test "at the root, another library's same-named folders neither get adopted nor take the name" do
       Application.put_env(@app, :attachments_parent_folder, {Hooks, :root})
       Application.put_env(@app, :attachments_folder_name, {Hooks, :news})
-      theirs = folder!("News", nil, %{library_uuid: library!().uuid})
+      theirs = for _ <- 1..2, do: folder!("News", nil, %{library_uuid: library!().uuid})
       group = group!("News")
+
+      assert {:ok, folder} = MediaFolders.ensure_group_folder(group, nil)
+
+      refute folder.uuid in Enum.map(theirs, & &1.uuid)
+      assert {folder.name, folder.parent_uuid} == {"News", nil}
+      assert to_string(folder.library_uuid) == Libraries.media_uuid()
+    end
+
+    test "a group pointing at a folder outside Media gets its own folder in Media" do
+      configure_default_hooks()
+      theirs = folder!("News", nil, %{library_uuid: library!().uuid})
+      group = group!("News", %{data: %{"media_folder_uuid" => theirs.uuid}})
 
       assert {:ok, folder} = MediaFolders.ensure_group_folder(group, nil)
 
       assert folder.uuid != theirs.uuid
       assert to_string(folder.library_uuid) == Libraries.media_uuid()
+      assert reload(group).data["media_folder_uuid"] == folder.uuid
     end
 
     test "strict: a raising parent hook is an error and creates nothing" do

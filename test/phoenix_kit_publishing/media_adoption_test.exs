@@ -231,6 +231,22 @@ defmodule PhoenixKit.Modules.Publishing.MediaAdoptionTest do
       assert reload(private).folder_uuid == nil
     end
 
+    test "a pointer at a folder outside Media is not the group's folder" do
+      theirs = folder!("News", nil, %{library_uuid: library!().uuid})
+      group = group!("News", %{data: %{"media_folder_uuid" => theirs.uuid}})
+      file = file!()
+      post!(group, version_data: %{"featured_image_uuid" => file.uuid})
+
+      {:ok, dry} = MediaAdoption.run(nil)
+      assert %{folder: :to_create, adopt: [_]} = entry(dry, group)
+
+      {:ok, _} = MediaAdoption.run(nil, apply?: true)
+
+      folder = group_folder(group)
+      assert folder.uuid != theirs.uuid
+      assert reload(file).folder_uuid == folder.uuid
+    end
+
     test "a hook that fails on apply leaves the group unfiled instead of using the root" do
       Application.put_env(
         @app,

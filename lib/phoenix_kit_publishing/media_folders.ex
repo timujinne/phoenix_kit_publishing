@@ -122,8 +122,7 @@ defmodule PhoenixKit.Modules.Publishing.MediaFolders do
     end
   end
 
-  defp in_media?(%Folder{library_uuid: library_uuid}),
-    do: to_string(library_uuid) == Libraries.media_uuid()
+  defp in_media?(%Folder{library_uuid: library_uuid}), do: Libraries.media?(library_uuid)
 
   defp remember_module_folder(uuid) do
     case Settings.update_setting(@module_folder_setting, uuid) do
@@ -206,28 +205,76 @@ defmodule PhoenixKit.Modules.Publishing.MediaFolders do
     end
   end
 
+  # Core's by-name lookups (`ResourceFolders.resolve/1`, and the "is the
+  # name taken" check inside `ensure/4`) do not look at the library and
+  # take the first row without an order, so at the root — a hook that
+  # answers `nil` — a person's private `News` could be adopted or could push
+  # the group onto its fallback name. The lookup and the name choice are
+  # therefore made here, in Media, oldest first; `ensure/4` is only asked to
+  # create (race-safe, claimed under its lock).
   defp create_group_folder(group, parent_uuid, host_name, actor_uuid) do
     deterministic = deterministic_name(group)
+    lookup = fn -> find_group_folder(group, parent_uuid, host_name, deterministic) end
 
-    ResourceFolders.ensure(host_name || deterministic, parent_uuid, actor_uuid,
-      lookup: fn ->
-        [
-          parent: parent_uuid,
-          host_name: host_name,
-          name: deterministic,
-          anywhere: true,
-          claimed?: &claimed_by_other?(&1, group)
-        ]
-        |> ResourceFolders.resolve()
-        |> only_media()
-      end,
-      fallback_name: deterministic,
+    name =
+      if is_binary(host_name) and media_folder_named(host_name, parent_uuid),
+        do: deterministic,
+        else: host_name || deterministic
+
+    ResourceFolders.ensure(name, parent_uuid, actor_uuid,
+      lookup: lookup,
       claim: &ResourceFolders.write_pointer(PublishingGroup, group.uuid, @pointer, &1.uuid)
     )
   end
 
-  defp only_media(%Folder{} = folder), do: if(in_media?(folder), do: folder)
-  defp only_media(nil), do: nil
+  # `ResourceFolders.resolve/1`'s order, in Media only: the host name
+  # directly under the parent unless another group points at that folder,
+  # then the deterministic name under the parent, at the root, anywhere.
+  defp find_group_folder(group, parent_uuid, host_name, deterministic) do
+    host_folder(group, parent_uuid, host_name, deterministic) ||
+      deterministic_folder(deterministic, parent_uuid)
+  end
+
+  defp host_folder(group, parent_uuid, host_name, deterministic)
+       when is_binary(host_name) and host_name != deterministic do
+    case media_folder_named(host_name, parent_uuid) do
+      %Folder{} = folder -> if claimed_by_other?(folder, group), do: nil, else: folder
+      nil -> nil
+    end
+  end
+
+  defp host_folder(_group, _parent_uuid, _host_name, _deterministic), do: nil
+
+  defp media_folder_named(name, parent_uuid) do
+    media_folders_named(name)
+    |> where([f], ^directly_under(parent_uuid))
+    |> limit(1)
+    |> repo().one()
+  end
+
+  defp deterministic_folder(name, parent_uuid) do
+    name
+    |> media_folders_named()
+    |> repo().all()
+    |> Enum.min_by(&place_rank(&1, parent_uuid), fn -> nil end)
+  end
+
+  defp media_folders_named(name) do
+    from(f in Folder,
+      where: f.name == ^name and is_nil(f.trashed_at),
+      where: f.library_uuid == ^Libraries.media_uuid(),
+      order_by: [asc: f.inserted_at, asc: f.uuid]
+    )
+  end
+
+  defp directly_under(nil), do: dynamic([f], is_nil(f.parent_uuid))
+  defp directly_under(parent_uuid), do: dynamic([f], f.parent_uuid == ^parent_uuid)
+
+  # Rows come oldest first and `Enum.min_by/3` keeps the first of equal
+  # ranks: under the parent, then at the root, then anywhere.
+  defp place_rank(%Folder{parent_uuid: parent}, parent), do: 0
+  defp place_rank(%Folder{parent_uuid: nil}, _parent), do: 1
+  defp place_rank(%Folder{}, _parent), do: 2
 
   defp parent_for(group, actor_uuid, false),
     do: {:ok, ResourceFolders.parent_uuid(@app, :group, actor_uuid, group)}
@@ -290,10 +337,10 @@ defmodule PhoenixKit.Modules.Publishing.MediaFolders do
       end
     else
       nil ->
-        {:error, :group_not_found}
+        not_filed(slug, :group_not_found)
 
       %PublishingGroup{} ->
-        {:error, :group_not_active}
+        not_filed(slug, :group_not_active)
 
       {:error, reason} = error ->
         Logger.warning(
@@ -316,6 +363,11 @@ defmodule PhoenixKit.Modules.Publishing.MediaFolders do
       |> repo().all()
 
     Enum.reject(file_uuids, fn uuid -> Enum.any?(cast(uuid), &(&1 in managed)) end)
+  end
+
+  defp not_filed(slug, reason) do
+    Logger.warning("[Publishing] nothing filed for group #{inspect(slug)}: #{inspect(reason)}")
+    {:error, reason}
   end
 
   defp attach(file_uuid, folder_uuid) do
