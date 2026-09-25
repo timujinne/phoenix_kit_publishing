@@ -28,21 +28,24 @@ defmodule PhoenixKitPublishing.CorePinConformanceTest do
       offset `0`, so every timestamp post is stamped, released and syndicated
       on UTC with no error anywhere. A present-but-wrong function is why this
       floor is about behaviour, not just arity.
+    * The group media folders (`MediaFolders`, `MediaAdoption`,
+      `MediaReorganizer`) are built on `Storage.ResourceFolders` and the
+      reorganizer's `ResourceSource`, both first shipped in core 2.38.0 — the
+      current floor.
 
-  The floor rounds 2.13.9 up to `~> 2.14` to keep the ecosystem's two-segment
-  shape. Raise this alongside `mix.exs` whenever a newly-adopted core API — or
-  a newly-relied-on core BEHAVIOUR — sets a higher one.
+  Raise this alongside `mix.exs` whenever a newly-adopted core API — or a
+  newly-relied-on core BEHAVIOUR — sets a higher one.
 
   Core 1.7 is deliberately excluded: core 2.0.0 squashed the migration chain to
   a V135 floor and this module is verified only against that baseline.
   """
 
-  # Floor: core 2.14.0 (IANA-aware `Utils.Date`, 2.13.9 rounded up). Everything
-  # above it, forever, must stay admitted — that is the two-segment invariant
-  # this test exists for. 2.13.9 sits in @must_reject because the pin is the
-  # rounded floor, not the exact one; move both lists together.
-  @must_admit ["2.14.0", "2.14.9", "2.15.0", "2.99.4"]
-  @must_reject ["1.7.189", "1.7.236", "1.9.4", "2.0.0", "2.3.9", "2.13.9", "3.0.0"]
+  # Floor: core 2.38.0 (`Storage.ResourceFolders` / `ResourceSource`).
+  # Everything above it, forever, must stay admitted — that is the two-segment
+  # invariant this test exists for. 2.37.5 is the last core without them; move
+  # both lists together.
+  @must_admit ["2.38.0", "2.39.0", "2.40.0", "2.99.4"]
+  @must_reject ["1.7.189", "1.9.4", "2.0.0", "2.13.9", "2.14.0", "2.37.5", "3.0.0"]
 
   test "the :phoenix_kit requirement admits every core 2.x and nothing else" do
     requirement = core_requirement()
