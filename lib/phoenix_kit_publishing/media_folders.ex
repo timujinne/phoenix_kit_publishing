@@ -217,8 +217,9 @@ defmodule PhoenixKit.Modules.Publishing.MediaFolders do
   # transaction under the name locks core's own `ensure/4` and the
   # reorganizer's pointer back-fill take: `{parent, host name}` — so every
   # group claiming the same host name (group names are not unique) queues
-  # on it — and `{parent, deterministic name}`. `ensure/4` is only asked to
-  # create; a name core refuses (taken, too long) falls back to the
+  # on it — and `{parent, deterministic name}`, taken in sorted order; the
+  # group's pointer is then re-read under a row lock. `ensure/4` is only
+  # asked to create; a name core refuses (taken, too long) falls back to the
   # deterministic one, which cannot collide.
   defp create_group_folder(group, parent_uuid, host_name, actor_uuid) do
     deterministic = deterministic_name(group)
@@ -243,13 +244,39 @@ defmodule PhoenixKit.Modules.Publishing.MediaFolders do
   end
 
   defp claim_folder(group, lookup, host, deterministic, parent_uuid, actor_uuid) do
-    if host, do: ResourceFolders.lock_name(parent_uuid, host)
-    ResourceFolders.lock_name(parent_uuid, deterministic)
+    # Both name locks, always in the same (sorted) order, so two claims
+    # whose names cross — one group's host name being the other's
+    # deterministic one — never wait on each other in opposite orders. Then
+    # the group row, as the reorganizer's back-fill does after its name lock.
+    [host, deterministic]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.sort()
+    |> Enum.each(&ResourceFolders.lock_name(parent_uuid, &1))
 
+    # The pointer as it is now, not as the caller's struct had it: another
+    # upload may have claimed a folder since — used as is, never replaced.
+    case media_folder(locked_pointer(group.uuid)) do
+      %Folder{} = folder -> {:ok, folder}
+      nil -> create_and_point(group, lookup, host, deterministic, parent_uuid, actor_uuid)
+    end
+  end
+
+  defp create_and_point(group, lookup, host, deterministic, parent_uuid, actor_uuid) do
     with {:ok, folder} <- find_or_create(lookup, host, deterministic, parent_uuid, actor_uuid),
          :ok <- ResourceFolders.write_pointer(PublishingGroup, group.uuid, @pointer, folder.uuid) do
       {:ok, folder}
     end
+  end
+
+  # `nil` for a group deleted meanwhile: the pointer write then answers
+  # `{:error, :not_found}` and the transaction takes the new folder back.
+  defp locked_pointer(group_uuid) do
+    from(g in PublishingGroup,
+      where: g.uuid == ^group_uuid,
+      lock: "FOR UPDATE",
+      select: fragment("?->>?", g.data, ^elem(@pointer, 1))
+    )
+    |> repo().one()
   end
 
   defp find_or_create(lookup, host, deterministic, parent_uuid, actor_uuid) do

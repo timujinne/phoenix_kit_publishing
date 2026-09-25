@@ -179,6 +179,9 @@ defmodule PhoenixKit.Modules.Publishing.MediaFoldersTest do
       Application.put_env(@app, :attachments_parent_folder, {Hooks, :root})
       Application.put_env(@app, :attachments_folder_name, {Hooks, :news})
       group = group!("News")
+      # An unclaimed "News" already there: the claim adopts it, and must do
+      # so under the host-name lock, not only the deterministic one.
+      news = folder!("News")
 
       # A second connection holds the lock core's ensure/4 and the
       # reorganizer's back-fill take for "News" at the root.
@@ -194,8 +197,51 @@ defmodule PhoenixKit.Modules.Publishing.MediaFoldersTest do
       assert Task.yield(task, 300) == nil
 
       Postgrex.query!(other, "SELECT pg_advisory_unlock(hashtext($1))", [key])
-      assert {:ok, {:ok, %Folder{name: "News"}}} = Task.yield(task, 5_000)
+      assert {:ok, {:ok, %Folder{uuid: uuid}}} = Task.yield(task, 5_000)
+      assert uuid == news.uuid
       GenServer.stop(other)
+    end
+
+    test "a group's claim also queues on the lock of its deterministic name" do
+      Application.put_env(@app, :attachments_parent_folder, {Hooks, :root})
+      group = group!("News")
+
+      {:ok, other} =
+        Repo.config()
+        |> Keyword.take([:hostname, :port, :username, :password, :database])
+        |> Postgrex.start_link()
+
+      key = ResourceFolders.name_lock_key(nil, "publishing-group-" <> group.uuid)
+      Postgrex.query!(other, "SELECT pg_advisory_lock(hashtext($1))", [key])
+
+      task = Task.async(fn -> MediaFolders.ensure_group_folder(group, nil) end)
+      assert Task.yield(task, 300) == nil
+
+      Postgrex.query!(other, "SELECT pg_advisory_unlock(hashtext($1))", [key])
+      assert {:ok, {:ok, %Folder{}}} = Task.yield(task, 5_000)
+      GenServer.stop(other)
+    end
+
+    test "a group deleted meanwhile leaves no folder behind" do
+      configure_default_hooks()
+      {:ok, _} = MediaFolders.module_folder(:group, nil, nil)
+      group = group!("News")
+      Repo.delete!(group)
+
+      assert {:error, _reason} = MediaFolders.ensure_group_folder(group, nil)
+      assert live_folders_named("News") == []
+    end
+
+    test "a pointer written since the group was loaded is used, not overwritten" do
+      configure_default_hooks()
+      stale = group!("News")
+      {:ok, current} = MediaFolders.ensure_group_folder(stale, nil)
+      # Renamed since: no lookup by name finds it; only the pointer does.
+      {:ok, _} = Storage.update_folder(current, %{name: "Новости"})
+
+      assert {:ok, %Folder{uuid: uuid}} = MediaFolders.ensure_group_folder(stale, nil)
+      assert uuid == current.uuid
+      assert reload(stale).data["media_folder_uuid"] == current.uuid
     end
 
     test "strict: a raising parent hook is an error and creates nothing" do
