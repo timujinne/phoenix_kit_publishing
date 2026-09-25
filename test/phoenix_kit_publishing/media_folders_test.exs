@@ -6,6 +6,8 @@ defmodule PhoenixKit.Modules.Publishing.MediaFoldersTest do
   alias PhoenixKit.Modules.Publishing.MediaFolders
   alias PhoenixKit.Modules.Storage
   alias PhoenixKit.Modules.Storage.Folder
+  alias PhoenixKit.Modules.Storage.Libraries
+  alias PhoenixKitPublishing.Test.MediaHooks, as: Hooks
 
   @app :phoenix_kit_publishing
 
@@ -51,6 +53,24 @@ defmodule PhoenixKit.Modules.Publishing.MediaFoldersTest do
 
       assert {:ok, ^uuid} = MediaFolders.module_folder(:group, nil, nil)
       assert live_folders_named("Publishing") == []
+    end
+
+    test "never takes a \"Publishing\" folder of another library" do
+      private = library!()
+      theirs = folder!("Publishing", nil, %{library_uuid: private.uuid})
+
+      assert {:ok, uuid} = MediaFolders.module_folder(:group, nil, nil)
+
+      assert uuid != theirs.uuid
+      assert to_string(Repo.get!(Folder, uuid).library_uuid) == Libraries.media_uuid()
+    end
+
+    test "ignores a remembered folder that is not in Media" do
+      theirs = folder!("Publishing", nil, %{library_uuid: library!().uuid})
+      {:ok, _} = PhoenixKit.Settings.update_setting("publishing_media_folder_uuid", theirs.uuid)
+
+      assert {:ok, uuid} = MediaFolders.module_folder(:group, nil, nil)
+      assert uuid != theirs.uuid
     end
 
     test "makes a new one when its folder was trashed" do
@@ -118,6 +138,55 @@ defmodule PhoenixKit.Modules.Publishing.MediaFoldersTest do
     end
   end
 
+  describe "ensure_group_folder/3 and failing or unusual hooks" do
+    test "does not adopt a same-named folder of another library" do
+      Application.put_env(@app, :attachments_parent_folder, {Hooks, :root})
+      Application.put_env(@app, :attachments_folder_name, {Hooks, :news})
+      theirs = folder!("News", nil, %{library_uuid: library!().uuid})
+      group = group!("News")
+
+      assert {:ok, folder} = MediaFolders.ensure_group_folder(group, nil)
+
+      assert folder.uuid != theirs.uuid
+      assert to_string(folder.library_uuid) == Libraries.media_uuid()
+    end
+
+    test "strict: a raising parent hook is an error and creates nothing" do
+      Application.put_env(@app, :attachments_parent_folder, {Hooks, :boom})
+      group = group!("News")
+
+      assert {:error, {:parent_hook, %RuntimeError{}}} =
+               MediaFolders.ensure_group_folder(group, nil, strict: true)
+
+      assert Repo.aggregate(Folder, :count) == 0
+      assert reload(group).data["media_folder_uuid"] == nil
+    end
+
+    test "not strict (an upload): a raising parent hook falls back to the root" do
+      Application.put_env(@app, :attachments_parent_folder, {Hooks, :boom})
+      group = group!("News")
+
+      assert {:ok, %Folder{parent_uuid: nil}} = MediaFolders.ensure_group_folder(group, nil)
+    end
+  end
+
+  describe "hook_problems/0" do
+    test "names a hook that is not a pair or not exported, without calling anything" do
+      assert MediaFolders.hook_problems() == []
+
+      Application.put_env(@app, :attachments_parent_folder, {Hooks, :no_such_function})
+      Application.put_env(@app, :attachments_folder_name, "News")
+
+      assert [parent, name] = MediaFolders.hook_problems()
+      assert parent =~ "attachments_parent_folder"
+      assert parent =~ "not callable"
+      assert name =~ "attachments_folder_name"
+
+      configure_default_hooks()
+      assert MediaFolders.hook_problems() == []
+    end
+  end
+
   describe "file_for_group/3" do
     test "does nothing on a host without a parent hook" do
       group = group!("News")
@@ -162,6 +231,30 @@ defmodule PhoenixKit.Modules.Publishing.MediaFoldersTest do
 
       assert uuid == trashed.uuid
       assert reload(trashed).folder_uuid == nil
+    end
+
+    test "files nothing for a trashed group" do
+      configure_default_hooks()
+      group = group!("Old", %{status: "trashed"})
+      file = file!()
+
+      assert MediaFolders.file_for_group(group.slug, [file.uuid], nil) ==
+               {:error, :group_not_active}
+
+      assert reload(file).folder_uuid == nil
+      assert live_folders_named("Publishing") == []
+    end
+
+    test "leaves a system-managed file alone" do
+      configure_default_hooks()
+      group = group!("News")
+      managed = file!(%{system_managed: true})
+      regular = file!()
+
+      assert MediaFolders.file_for_group(group.slug, [managed.uuid, regular.uuid], nil) == :ok
+
+      assert reload(managed).folder_uuid == nil
+      assert reload(regular).folder_uuid != nil
     end
 
     test "answers an unknown group without creating anything" do

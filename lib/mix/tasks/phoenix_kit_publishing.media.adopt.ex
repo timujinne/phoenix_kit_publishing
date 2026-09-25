@@ -17,7 +17,8 @@ defmodule Mix.Tasks.PhoenixKitPublishing.Media.Adopt do
 
   Folders are created as the first user with the "Owner" role, like
   `mix phoenix_kit.media.reorganize`. Exits `1` when the host has not
-  configured the hook, or when `--apply` could not file something.
+  configured the hook, when a configured hook is not callable, or when
+  `--apply` could not file something.
 
   In a release, without Mix: `PhoenixKit.Modules.Publishing.MediaAdoption.run(actor_uuid, apply?: true)`.
   """
@@ -51,6 +52,12 @@ defmodule Mix.Tasks.PhoenixKitPublishing.Media.Adopt do
       {:ok, report} ->
         Mix.shell().info(MediaAdoption.format_report(report))
         if apply? and failures?(report), do: exit({:shutdown, 1})
+
+      {:error, {:bad_hooks, problems}} ->
+        halt_with_error(
+          "The configured media hooks cannot be called, nothing was planned:\n  " <>
+            Enum.join(problems, "\n  ")
+        )
 
       {:error, :not_configured} ->
         halt_with_error("""

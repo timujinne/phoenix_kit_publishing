@@ -87,8 +87,34 @@ defmodule PhoenixKitPublishing.Test.MediaFixtures do
     })
   end
 
-  def folder!(name, parent_uuid \\ nil) do
-    Repo.insert!(%Folder{name: name, parent_uuid: parent_uuid})
+  def folder!(name, parent_uuid \\ nil, attrs \\ %{}) do
+    Repo.insert!(struct(Folder, Map.merge(%{name: name, parent_uuid: parent_uuid}, attrs)))
+  end
+
+  @doc "A person's own storage library (core V203), besides the site's Media."
+  def library! do
+    n = System.unique_integer([:positive])
+
+    Repo.insert!(%PhoenixKit.Modules.Storage.Library{
+      name: "Private #{n}",
+      kind: "user",
+      visibility: "private",
+      owner_uuid: user!().uuid,
+      key_prefix: "private-#{n}",
+      slug: "private-#{n}"
+    })
+  end
+
+  def file_instance!(%StorageFile{uuid: file_uuid}, variant \\ "large") do
+    Repo.insert!(%PhoenixKit.Modules.Storage.FileInstance{
+      file_uuid: file_uuid,
+      variant_name: variant,
+      file_name: "#{file_uuid}-#{variant}.png",
+      mime_type: "image/png",
+      ext: "png",
+      checksum: "instance-checksum-#{System.unique_integer([:positive])}",
+      size: 1
+    })
   end
 
   def reload(%StorageFile{uuid: uuid}), do: Repo.get!(StorageFile, uuid)
@@ -104,4 +130,12 @@ defmodule PhoenixKitPublishing.Test.MediaFixtures do
       )
     )
   end
+end
+
+defmodule PhoenixKitPublishing.Test.MediaHooks do
+  @moduledoc "Host hooks for the media-folder tests: a root answer, a broken one, a fixed name."
+
+  def root(_kind, _actor_uuid, _group), do: nil
+  def boom(_kind, _actor_uuid, _group), do: raise("hook bug")
+  def news(_group, _actor_uuid), do: {:ok, "News"}
 end

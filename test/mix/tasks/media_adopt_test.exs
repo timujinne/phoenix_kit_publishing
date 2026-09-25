@@ -41,6 +41,13 @@ defmodule Mix.Tasks.PhoenixKitPublishing.Media.AdoptTest do
     assert output() =~ "attachments_parent_folder"
   end
 
+  test "names a hook that cannot be called and plans nothing" do
+    Application.put_env(@app, :attachments_parent_folder, {MediaFolders, :no_such_hook})
+
+    assert catch_exit(Adopt.run([])) == {:shutdown, 1}
+    assert output() =~ "no_such_hook is not callable"
+  end
+
   test "a dry run prints the plan and writes nothing" do
     configure_default_hooks()
     file = file!()

@@ -32,11 +32,15 @@ defmodule PhoenixKit.Modules.Publishing.MediaAdoption do
   and other-library files are skipped. A group with nothing to file gets
   no folder.
 
-  A dry run reads four queries' worth of rows, calls no hook and writes
-  nothing, so it cannot know the name a folder not created yet will get.
-  Applying calls the hooks (`MediaFolders.ensure_group_folder/2`) for each
-  group with something to file. A file's URL does not depend on its
-  folder, so nothing anyone has published changes.
+  A dry run reads (six queries, whatever the number of posts), calls no
+  hook and writes nothing, so it cannot know the name a folder not created
+  yet will get. It does check that the configured hooks are callable:
+  either run refuses with `{:error, {:bad_hooks, problems}}` when one is
+  not. Applying calls the hooks (`MediaFolders.ensure_group_folder/3`,
+  strict) for each group with something to file; a hook that fails leaves
+  that group unfiled and says so, instead of creating its folder at the
+  media root. A file's URL does not depend on its folder, so nothing anyone
+  has published changes.
   """
 
   import Ecto.Query
@@ -71,18 +75,26 @@ defmodule PhoenixKit.Modules.Publishing.MediaAdoption do
   @doc """
   Plans (and with `apply?: true` applies) the filing of every active
   group's media. `{:error, :not_configured}` on a host without the parent
-  hook — there is no folder to file into.
+  hook — there is no folder to file into; `{:error, {:bad_hooks, problems}}`
+  when a configured hook is not callable (`MediaFolders.hook_problems/0`).
   """
-  @spec run(String.t() | nil, keyword()) :: {:ok, report()} | {:error, :not_configured}
+  @spec run(String.t() | nil, keyword()) ::
+          {:ok, report()} | {:error, :not_configured | {:bad_hooks, [String.t()]}}
   def run(actor_uuid, opts \\ []) do
-    if MediaFolders.enabled?() do
+    with :ok <- check_config() do
       apply? = Keyword.get(opts, :apply?, false)
       groups = plan()
       groups = if apply?, do: Enum.map(groups, &apply_entry(&1, actor_uuid)), else: groups
 
       {:ok, %{applied?: apply?, groups: groups}}
-    else
-      {:error, :not_configured}
+    end
+  end
+
+  defp check_config do
+    case {MediaFolders.enabled?(), MediaFolders.hook_problems()} do
+      {false, _problems} -> {:error, :not_configured}
+      {true, []} -> :ok
+      {true, problems} -> {:error, {:bad_hooks, problems}}
     end
   end
 
@@ -274,7 +286,7 @@ defmodule PhoenixKit.Modules.Publishing.MediaAdoption do
   defp apply_entry(%{adopt: [], link: []} = entry, _actor_uuid), do: entry
 
   defp apply_entry(entry, actor_uuid) do
-    case MediaFolders.ensure_group_folder(entry.group, actor_uuid) do
+    case MediaFolders.ensure_group_folder(entry.group, actor_uuid, strict: true) do
       {:ok, folder} ->
         result =
           Enum.reduce(
@@ -349,8 +361,12 @@ defmodule PhoenixKit.Modules.Publishing.MediaAdoption do
 
   defp format_failures(failed) do
     ", failed " <>
-      Enum.map_join(failed, ", ", fn {what, reason} ->
-        "#{what}: #{ResourceFolders.describe_failure(reason)}"
+      Enum.map_join(failed, ", ", fn
+        {:folder, {hook, reason}} when hook in [:parent_hook, :name_hook] ->
+          "folder not created, #{hook} failed: #{ResourceFolders.describe_failure(reason)}"
+
+        {what, reason} ->
+          "#{what}: #{ResourceFolders.describe_failure(reason)}"
       end)
   end
 

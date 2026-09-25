@@ -38,11 +38,15 @@ defmodule PhoenixKit.Modules.Publishing.MediaFolders do
   media reorganizer's job (`PhoenixKit.Modules.Publishing.MediaReorganizer`).
   """
 
+  import Ecto.Query
+
   require Logger
 
   alias PhoenixKit.Modules.Publishing.DBStorage
   alias PhoenixKit.Modules.Publishing.PublishingGroup
+  alias PhoenixKit.Modules.Storage.File, as: StorageFile
   alias PhoenixKit.Modules.Storage.Folder
+  alias PhoenixKit.Modules.Storage.Libraries
   alias PhoenixKit.Modules.Storage.ResourceFolders
   alias PhoenixKit.Settings
 
@@ -75,23 +79,51 @@ defmodule PhoenixKit.Modules.Publishing.MediaFolders do
   # ── Ready-made hooks ───────────────────────────────────────────────
 
   @doc """
-  Parent hook: the module's `Publishing` folder at the media root, created
-  on first use and remembered by uuid, so it may be renamed or moved.
+  Parent hook: the module's `Publishing` folder at the root of the site's
+  media library (Media), created on first use and remembered by uuid, so it
+  may be renamed or moved. A folder of that name in any other library — a
+  person's private one — is never taken for it.
   """
   @spec module_folder(atom(), String.t() | nil, term()) :: {:ok, String.t()} | {:error, term()}
   def module_folder(_kind, actor_uuid, _subject) do
-    case ResourceFolders.live_folder(Settings.get_setting(@module_folder_setting)) do
+    case media_folder(Settings.get_setting(@module_folder_setting)) do
       %Folder{uuid: uuid} ->
         {:ok, uuid}
 
       nil ->
         with {:ok, %Folder{uuid: uuid}} <-
-               ResourceFolders.ensure(@module_folder_name, nil, actor_uuid) do
+               ResourceFolders.ensure(@module_folder_name, nil, actor_uuid,
+                 lookup: &media_root_module_folder/0
+               ) do
           remember_module_folder(uuid)
           {:ok, uuid}
         end
     end
   end
+
+  # Core's by-name lookups do not look at the library (`find_under/2` takes
+  # the first live folder of that name at the root of ANY library), so the
+  # module folder is looked up here, in Media only. A new one is created in
+  # Media too: that is where a folder without a library goes.
+  defp media_root_module_folder do
+    from(f in Folder,
+      where: f.name == ^@module_folder_name and is_nil(f.parent_uuid) and is_nil(f.trashed_at),
+      where: f.library_uuid == ^Libraries.media_uuid(),
+      order_by: [asc: f.inserted_at, asc: f.uuid],
+      limit: 1
+    )
+    |> repo().one()
+  end
+
+  defp media_folder(uuid) do
+    case ResourceFolders.live_folder(uuid) do
+      %Folder{} = folder -> if in_media?(folder), do: folder
+      nil -> nil
+    end
+  end
+
+  defp in_media?(%Folder{library_uuid: library_uuid}),
+    do: to_string(library_uuid) == Libraries.media_uuid()
 
   defp remember_module_folder(uuid) do
     case Settings.update_setting(@module_folder_setting, uuid) do
@@ -114,38 +146,108 @@ defmodule PhoenixKit.Modules.Publishing.MediaFolders do
 
   def group_folder_name(_subject, _actor_uuid), do: nil
 
+  @doc """
+  What is wrong with the configured hooks, without calling them: a key that
+  is not a `{module, function}` pair, or names a function that is not
+  exported (the parent hook at arity 3 or 2, the name hook at arity 2).
+  `[]` when both are fine or unset.
+  """
+  @spec hook_problems() :: [String.t()]
+  def hook_problems do
+    [
+      hook_problem(:attachments_parent_folder, [3, 2]),
+      hook_problem(:attachments_folder_name, [2])
+    ]
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp hook_problem(key, arities) do
+    case Application.get_env(@app, key) do
+      nil ->
+        nil
+
+      {mod, fun} when is_atom(mod) and is_atom(fun) ->
+        if Code.ensure_loaded?(mod) and Enum.any?(arities, &function_exported?(mod, fun, &1)),
+          do: nil,
+          else: "#{key}: #{inspect(mod)}.#{fun} is not callable"
+
+      _other ->
+        "#{key}: not a {module, function} pair"
+    end
+  end
+
   # ── Group folders ──────────────────────────────────────────────────
 
   @doc """
   The group's folder, found or created under the parent hook's answer, the
   group's pointer written in the same locked step. A host name taken by
-  another group's folder falls back to the deterministic name.
+  another group's folder falls back to the deterministic name. Only folders
+  of the site's media library (Media) are ever adopted.
+
+  A failing hook falls back to the media root and the deterministic name,
+  logged — an upload never fails on a host hook. With `strict: true` (the
+  one-time adoption) a failing hook is `{:error, {:parent_hook | :name_hook,
+  reason}}` instead and nothing is created.
   """
-  @spec ensure_group_folder(PublishingGroup.t(), String.t() | nil) ::
+  @spec ensure_group_folder(PublishingGroup.t(), String.t() | nil, keyword()) ::
           {:ok, Folder.t()} | {:error, term()}
-  def ensure_group_folder(%PublishingGroup{} = group, actor_uuid) do
-    case ResourceFolders.live_folder(ResourceFolders.pointer_value(group, @pointer)) do
+  def ensure_group_folder(%PublishingGroup{} = group, actor_uuid, opts \\ []) do
+    strict? = Keyword.get(opts, :strict, false)
+
+    case media_folder(ResourceFolders.pointer_value(group, @pointer)) do
       %Folder{} = folder ->
         {:ok, folder}
 
       nil ->
-        parent_uuid = ResourceFolders.parent_uuid(@app, :group, actor_uuid, group)
-        host_name = ResourceFolders.host_name(@app, group, actor_uuid)
-        deterministic = deterministic_name(group)
+        with {:ok, parent_uuid} <- parent_for(group, actor_uuid, strict?),
+             {:ok, host_name} <- name_for(group, actor_uuid, strict?) do
+          create_group_folder(group, parent_uuid, host_name, actor_uuid)
+        end
+    end
+  end
 
-        ResourceFolders.ensure(host_name || deterministic, parent_uuid, actor_uuid,
-          lookup: fn ->
-            ResourceFolders.resolve(
-              parent: parent_uuid,
-              host_name: host_name,
-              name: deterministic,
-              anywhere: true,
-              claimed?: &claimed_by_other?(&1, group)
-            )
-          end,
-          fallback_name: deterministic,
-          claim: &ResourceFolders.write_pointer(PublishingGroup, group.uuid, @pointer, &1.uuid)
-        )
+  defp create_group_folder(group, parent_uuid, host_name, actor_uuid) do
+    deterministic = deterministic_name(group)
+
+    ResourceFolders.ensure(host_name || deterministic, parent_uuid, actor_uuid,
+      lookup: fn ->
+        [
+          parent: parent_uuid,
+          host_name: host_name,
+          name: deterministic,
+          anywhere: true,
+          claimed?: &claimed_by_other?(&1, group)
+        ]
+        |> ResourceFolders.resolve()
+        |> only_media()
+      end,
+      fallback_name: deterministic,
+      claim: &ResourceFolders.write_pointer(PublishingGroup, group.uuid, @pointer, &1.uuid)
+    )
+  end
+
+  defp only_media(%Folder{} = folder), do: if(in_media?(folder), do: folder)
+  defp only_media(nil), do: nil
+
+  defp parent_for(group, actor_uuid, false),
+    do: {:ok, ResourceFolders.parent_uuid(@app, :group, actor_uuid, group)}
+
+  defp parent_for(group, actor_uuid, true) do
+    case ResourceFolders.parent_hook(@app, :group, actor_uuid, group) do
+      {:ok, parent_uuid} -> {:ok, parent_uuid}
+      :unconfigured -> {:ok, nil}
+      {:error, reason} -> {:error, {:parent_hook, reason}}
+    end
+  end
+
+  defp name_for(group, actor_uuid, false),
+    do: {:ok, ResourceFolders.host_name(@app, group, actor_uuid)}
+
+  defp name_for(group, actor_uuid, true) do
+    case ResourceFolders.name_hook(@app, group, actor_uuid) do
+      {:ok, name} -> {:ok, name}
+      :unconfigured -> {:ok, nil}
+      {:error, reason} -> {:error, {:name_hook, reason}}
     end
   end
 
@@ -159,7 +261,9 @@ defmodule PhoenixKit.Modules.Publishing.MediaFolders do
   @doc """
   Puts `file_uuids` into the folder of the group `slug` (see the moduledoc's
   "Filing"). `:disabled` on a host that has not opted in — nothing is read
-  or written then. Never raises; a file that could not be filed is named in
+  or written then. A trashed group is `{:error, :group_not_active}` (the
+  one-time adoption skips those too), and a system-managed file is left
+  alone. Never raises; a file that could not be filed is named in
   `{:error, [{file_uuid, reason}]}` and logged.
   """
   @spec file_for_group(String.t(), [String.t()], String.t() | nil) ::
@@ -175,9 +279,10 @@ defmodule PhoenixKit.Modules.Publishing.MediaFolders do
   defp do_file_for_group(_slug, [], _actor_uuid), do: :ok
 
   defp do_file_for_group(slug, file_uuids, actor_uuid) do
-    with %PublishingGroup{} = group <- group_by_slug(slug),
+    with %PublishingGroup{status: "active"} = group <- group_by_slug(slug),
          {:ok, %Folder{uuid: folder_uuid}} <- ensure_group_folder(group, actor_uuid) do
       file_uuids
+      |> without_system_managed()
       |> Enum.flat_map(&attach(&1, folder_uuid))
       |> case do
         [] -> :ok
@@ -187,6 +292,9 @@ defmodule PhoenixKit.Modules.Publishing.MediaFolders do
       nil ->
         {:error, :group_not_found}
 
+      %PublishingGroup{} ->
+        {:error, :group_not_active}
+
       {:error, reason} = error ->
         Logger.warning(
           "[Publishing] media folder for group #{inspect(slug)} unavailable: " <>
@@ -195,6 +303,19 @@ defmodule PhoenixKit.Modules.Publishing.MediaFolders do
 
         error
     end
+  end
+
+  # Tile chunks and an edited image's hidden original are core's own
+  # bookkeeping; the picker never offers them, and a forged event must not
+  # file one either.
+  defp without_system_managed(file_uuids) do
+    uuids = Enum.flat_map(file_uuids, &cast/1)
+
+    managed =
+      from(f in StorageFile, where: f.uuid in ^uuids and f.system_managed, select: f.uuid)
+      |> repo().all()
+
+    Enum.reject(file_uuids, fn uuid -> Enum.any?(cast(uuid), &(&1 in managed)) end)
   end
 
   defp attach(file_uuid, folder_uuid) do
@@ -215,8 +336,8 @@ defmodule PhoenixKit.Modules.Publishing.MediaFolders do
   defp group_by_slug(slug) when is_binary(slug), do: DBStorage.get_group_by_slug(slug)
   defp group_by_slug(_slug), do: nil
 
-  # The editor calls this in its own process: a database that raises or a
-  # pool that exits must cost the filing, never the edit.
+  # The editor calls this from a task: a database that raises or a pool that
+  # exits must cost the filing, never anything else.
   defp guarded(fun) do
     fun.()
   rescue
@@ -233,4 +354,15 @@ defmodule PhoenixKit.Modules.Publishing.MediaFolders do
 
     {:error, reason}
   end
+
+  defp cast(value) when is_binary(value) and byte_size(value) == 36 do
+    case Ecto.UUID.cast(value) do
+      {:ok, uuid} -> [String.downcase(uuid)]
+      :error -> []
+    end
+  end
+
+  defp cast(_value), do: []
+
+  defp repo, do: PhoenixKit.RepoHelper.repo()
 end

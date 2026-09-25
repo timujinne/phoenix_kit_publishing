@@ -5,10 +5,8 @@ defmodule PhoenixKit.Modules.Publishing.MediaAdoptionTest do
 
   alias PhoenixKit.Modules.Publishing.MediaAdoption
   alias PhoenixKit.Modules.Publishing.MediaFolders
-  alias PhoenixKit.Modules.Storage.File, as: StorageFile
   alias PhoenixKit.Modules.Storage.Folder
   alias PhoenixKit.Modules.Storage.FolderLink
-  alias PhoenixKit.Modules.Storage.URLSigner
 
   @app :phoenix_kit_publishing
 
@@ -195,17 +193,73 @@ defmodule PhoenixKit.Modules.Publishing.MediaAdoptionTest do
       assert folder_count() == folders_after_first
     end
 
-    test "baked file URLs stay the same" do
+    test "changes nothing about a file but its folder, so its URLs stay as they were" do
       group = group!("News")
       file = file!()
+      instance = file_instance!(file)
       post!(group, contents: [{"en", "![x](/file/#{file.uuid}/large/abcd)", %{}}])
-      before = URLSigner.signed_url(file.uuid, "large")
+
+      # A file URL is built from the file's uuid and variant (the token signs
+      # exactly those), and served from the instance row's stored object.
+      drop = [:__meta__, :folder_uuid, :updated_at]
+      before = file |> reload() |> Map.from_struct() |> Map.drop(drop)
 
       {:ok, _} = MediaAdoption.run(nil, apply?: true)
 
-      assert %StorageFile{folder_uuid: folder_uuid} = reload(file)
-      assert folder_uuid != nil
-      assert URLSigner.signed_url(file.uuid, "large") == before
+      after_file = reload(file)
+      assert after_file.folder_uuid == group_folder(group).uuid
+      assert after_file |> Map.from_struct() |> Map.drop(drop) == before
+      assert Repo.reload!(instance) == instance
+    end
+
+    test "skips system-managed files and files of another library" do
+      group = group!("News")
+      managed = file!(%{system_managed: true})
+      private = file!(%{library_uuid: library!().uuid})
+
+      post!(group,
+        version_data: %{"featured_image_uuid" => managed.uuid},
+        contents: [{"en", ~s(<Image file_uuid="#{private.uuid}"/>), %{}}]
+      )
+
+      {:ok, report} = MediaAdoption.run(nil, apply?: true)
+
+      assert %{adopt: [], link: [], skipped: %{system: 1, other_library: 1}} =
+               entry(report, group)
+
+      assert reload(managed).folder_uuid == nil
+      assert reload(private).folder_uuid == nil
+    end
+
+    test "a hook that fails on apply leaves the group unfiled instead of using the root" do
+      Application.put_env(
+        @app,
+        :attachments_parent_folder,
+        {PhoenixKitPublishing.Test.MediaHooks, :boom}
+      )
+
+      group = group!("News")
+      file = file!()
+      post!(group, version_data: %{"featured_image_uuid" => file.uuid})
+
+      {:ok, report} = MediaAdoption.run(nil, apply?: true)
+
+      assert %{failed: [{:folder, {:parent_hook, _}}]} = entry(report, group).result
+      assert MediaAdoption.format_report(report) =~ "parent_hook failed"
+      assert folder_count() == 0
+      assert reload(file).folder_uuid == nil
+    end
+  end
+
+  describe "run/2 with a hook that cannot be called" do
+    test "refuses before planning, dry run included" do
+      Application.put_env(@app, :attachments_folder_name, {MediaFolders, :no_such_hook})
+      post!(group!("News"), version_data: %{"featured_image_uuid" => file!().uuid})
+
+      assert {:error, {:bad_hooks, [problem]}} = MediaAdoption.run(nil)
+      assert problem =~ "attachments_folder_name"
+      assert {:error, {:bad_hooks, _}} = MediaAdoption.run(nil, apply?: true)
+      assert folder_count() == 0
     end
   end
 
