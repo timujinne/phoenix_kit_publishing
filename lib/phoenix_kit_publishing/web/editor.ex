@@ -40,6 +40,7 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor do
   alias PhoenixKit.Modules.Publishing.Constants
   alias PhoenixKit.Modules.Publishing.Errors
   alias PhoenixKit.Modules.Publishing.LanguageHelpers
+  alias PhoenixKit.Modules.Publishing.MediaFolders
   alias PhoenixKit.Modules.Publishing.PubSub, as: PublishingPubSub
   alias PhoenixKit.Modules.Publishing.Shared
   alias PhoenixKit.Modules.Publishing.SlugHelpers
@@ -2757,12 +2758,40 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor do
   end
 
   defp do_handle_media_selected(socket, file_ids) do
-    {socket, autosave?} =
-      apply_media_selection(socket, media_selection_kind(socket, file_ids), file_ids)
+    kind = media_selection_kind(socket, file_ids)
+    {socket, autosave?} = apply_media_selection(socket, kind, file_ids)
 
     socket = if autosave?, do: schedule_autosave(socket), else: socket
 
+    file_into_group_folder(socket, files_used_by(kind, file_ids))
+
     {:noreply, socket}
+  end
+
+  # The files a selection actually puts into the post: every image of a
+  # gallery, the first pick otherwise, nothing for a refused one.
+  defp files_used_by(:gallery, file_ids), do: file_ids
+
+  defp files_used_by(kind, [file_uuid | _])
+       when kind in [:slot, :image_component, :audio_component],
+       do: [file_uuid]
+
+  defp files_used_by(_kind, _file_ids), do: []
+
+  # Group media folders are the host's opt-in (`MediaFolders`); without it
+  # this is a config read and nothing else. A file that can't be filed is
+  # logged there and never gets in the way of the edit.
+  defp file_into_group_folder(_socket, []), do: :ok
+
+  defp file_into_group_folder(socket, file_uuids) do
+    _ =
+      MediaFolders.file_for_group(
+        socket.assigns.group_slug,
+        file_uuids,
+        Shared.actor_uuid_from_socket(socket)
+      )
+
+    :ok
   end
 
   # Which of the five things a Choose click can mean. Named up front so each
