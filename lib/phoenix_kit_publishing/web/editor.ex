@@ -2779,19 +2779,30 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor do
   defp files_used_by(_kind, _file_ids), do: []
 
   # Group media folders are the host's opt-in (`MediaFolders`); without it
-  # this is a config read and nothing else. A file that can't be filed is
-  # logged there and never gets in the way of the edit.
+  # this is a config read and nothing else. With it, the filing — a folder
+  # lookup and one transaction per file, a gallery's worth — runs in a task
+  # so the picker closes at once; a file that can't be filed is logged there
+  # and never gets in the way of the edit.
   defp file_into_group_folder(_socket, []), do: :ok
 
   defp file_into_group_folder(socket, file_uuids) do
-    _ =
-      MediaFolders.file_for_group(
-        socket.assigns.group_slug,
-        file_uuids,
-        Shared.actor_uuid_from_socket(socket)
-      )
+    if MediaFolders.enabled?() do
+      group_slug = socket.assigns.group_slug
+      actor_uuid = Shared.actor_uuid_from_socket(socket)
+      file = fn -> MediaFolders.file_for_group(group_slug, file_uuids, actor_uuid) end
+
+      start_filing(file)
+    end
 
     :ok
+  end
+
+  # Core's task supervisor, as the view counter uses it; a host without one
+  # running is an exit (noproc), and the filing then runs in place.
+  defp start_filing(file) do
+    Task.Supervisor.start_child(PhoenixKit.TaskSupervisor, file)
+  catch
+    :exit, _reason -> file.()
   end
 
   # Which of the five things a Choose click can mean. Named up front so each
