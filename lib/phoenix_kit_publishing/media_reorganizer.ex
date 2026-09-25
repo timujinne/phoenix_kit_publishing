@@ -38,7 +38,7 @@ defmodule PhoenixKit.Modules.Publishing.MediaReorganizer do
   alias PhoenixKit.Modules.Publishing.MediaFolders
   alias PhoenixKit.Modules.Publishing.PublishingGroup
   alias PhoenixKit.Modules.Storage.File, as: StorageFile
-  alias PhoenixKit.Modules.Storage.{Folder, FolderLink}
+  alias PhoenixKit.Modules.Storage.{Folder, FolderLink, Libraries}
   alias PhoenixKit.Modules.Storage.Reorganizer.ResourceSource
 
   @source "publishing"
@@ -53,7 +53,7 @@ defmodule PhoenixKit.Modules.Publishing.MediaReorganizer do
       for %{kind: :orphan, folder: %Folder{uuid: uuid}} <- core, into: %{}, do: {uuid, true}
 
     core ++
-      name_hook_problems() ++
+      name_hook_problems(core) ++
       pointer_orphans(reported) ++
       unfiled(actor_uuid, opts)
   end
@@ -75,7 +75,22 @@ defmodule PhoenixKit.Modules.Publishing.MediaReorganizer do
     }
   end
 
-  defp name_hook_problems do
+  # Core names a failing name hook only when it has asked it — once some
+  # group has a folder — so a broken one stays silent until then. Nothing is
+  # added when core already reported it, or when the module is not opted in
+  # (no parent hook: the name hook is never asked).
+  @core_name_hook_labels ["attachments folder-name hook", "attachments hooks"]
+
+  defp name_hook_problems(core) do
+    if MediaFolders.enabled?() and not core_reported_name_hook?(core),
+      do: name_hook_actions(),
+      else: []
+  end
+
+  defp core_reported_name_hook?(core),
+    do: Enum.any?(core, &(&1.kind == :hook_error and &1.label in @core_name_hook_labels))
+
+  defp name_hook_actions do
     MediaFolders.hook_problems()
     |> Enum.filter(&String.starts_with?(&1, "attachments_folder_name"))
     |> Enum.map(fn problem ->
@@ -90,19 +105,25 @@ defmodule PhoenixKit.Modules.Publishing.MediaReorganizer do
     end)
   end
 
-  # Every live folder a trashed group points at, core's own orphan reports
-  # left out (`reported`), so no folder is reported twice.
+  # Every live Media folder a trashed group points at, except one a live
+  # group points at too (it is that group's — core's claims rule) and one
+  # core's scan already reported (`reported`), so no folder is reported
+  # twice.
   defp pointer_orphans(reported) do
     folders =
       from(g in PublishingGroup,
         join: f in Folder,
         on: fragment("lower(?->>?)", g.data, ^pointer_key()) == type(f.uuid, :string),
         where: g.status == "trashed" and is_nil(f.trashed_at),
+        where: f.library_uuid == ^Libraries.media_uuid(),
         order_by: [asc: g.inserted_at, asc: g.uuid],
         select: {map(g, [:name, :slug]), f}
       )
       |> repo().all()
       |> Enum.reject(fn {_group, folder} -> Map.has_key?(reported, folder.uuid) end)
+
+    claimed = live_group_pointers(Enum.map(folders, fn {_group, folder} -> folder.uuid end))
+    folders = Enum.reject(folders, fn {_group, folder} -> folder.uuid in claimed end)
 
     counts = counts(Enum.map(folders, fn {_group, folder} -> folder.uuid end))
 
@@ -122,6 +143,17 @@ defmodule PhoenixKit.Modules.Publishing.MediaReorganizer do
   end
 
   defp pointer_key, do: elem(MediaFolders.pointer(), 1)
+
+  defp live_group_pointers([]), do: []
+
+  defp live_group_pointers(folder_uuids) do
+    from(g in PublishingGroup,
+      where: g.status != "trashed",
+      where: fragment("lower(?->>?)", g.data, ^pointer_key()) in ^folder_uuids,
+      select: fragment("lower(?->>?)", g.data, ^pointer_key())
+    )
+    |> repo().all()
+  end
 
   # `{files, links}` per folder, as the `Source` contract counts them: every
   # file row homed there (any status) and every link row.

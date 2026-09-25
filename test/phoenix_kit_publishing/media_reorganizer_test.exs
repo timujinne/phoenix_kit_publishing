@@ -118,6 +118,34 @@ defmodule PhoenixKit.Modules.Publishing.MediaReorganizerTest do
     assert reload(folder).parent_uuid == parent_uuid
   end
 
+  test "a trashed group's pointer at another library's folder or at a live group's folder is no orphan" do
+    configure_default_hooks()
+    private = folder!("Old", nil, %{library_uuid: library!().uuid})
+    point(group!("Old", %{status: "trashed"}), private)
+
+    shared = folder!("Shared")
+    point(group!("Live"), shared)
+    point(group!("Gone", %{status: "trashed"}), shared)
+
+    refute Enum.any?(run(), &(&1.kind == :orphan))
+  end
+
+  test "a broken name hook core already reported is not reported twice" do
+    Application.put_env(@app, :attachments_parent_folder, {MediaFolders, :module_folder})
+    Application.put_env(@app, :attachments_folder_name, {MediaFolders, :no_such_hook})
+    group = group!("News")
+    folder!("publishing-group-" <> group.uuid)
+
+    assert [%{kind: :hook_error, label: "attachments folder-name hook"}] =
+             Enum.filter(run(), &(&1.kind == :hook_error))
+  end
+
+  test "a broken name hook says nothing on a host that has not opted in" do
+    Application.put_env(@app, :attachments_folder_name, {MediaFolders, :no_such_hook})
+
+    assert run() == []
+  end
+
   test "a name hook that can't be called is reported even with nothing to move" do
     Application.put_env(@app, :attachments_parent_folder, {MediaFolders, :module_folder})
     Application.put_env(@app, :attachments_folder_name, {MediaFolders, :no_such_hook})
