@@ -87,9 +87,10 @@ is reported and left alone.
    folders move under the new parent (pointer back-fill for a folder found by
    its deterministic name). Orphans: core's scan reports a deterministic-named
    folder of a trashed or deleted group, but only at the root or under a
-   parent a hook named for a live group; publishing adds every live folder a
-   trashed group points at (any name, anywhere) that core did not already
-   report. A hard-deleted group's pointer went with the row, so only core's
+   parent a hook named for a live group; publishing adds every live Media
+   folder a trashed group points at (any name, anywhere), once per folder,
+   unless a live group points at it too or core already reported it; a
+   folder in another library is never reported. A hard-deleted group's pointer went with the row, so only core's
    scan can find its folder. `extra`-style reports also cover a name hook
    that can't be called (core reports only the parent hook) and `:unfiled`,
    groups whose files are still outside their folder, so the core dry run

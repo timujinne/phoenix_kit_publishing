@@ -130,6 +130,16 @@ defmodule PhoenixKit.Modules.Publishing.MediaReorganizerTest do
     refute Enum.any?(run(), &(&1.kind == :orphan))
   end
 
+  test "a folder two trashed groups point at is reported once" do
+    configure_default_hooks()
+    shared = folder!("Shared")
+    point(group!("Old", %{status: "trashed"}), shared)
+    point(group!("Older", %{status: "trashed"}), shared)
+
+    assert [%{kind: :orphan, folder: %{uuid: uuid}}] = run()
+    assert uuid == shared.uuid
+  end
+
   test "a broken name hook core already reported is not reported twice" do
     Application.put_env(@app, :attachments_parent_folder, {MediaFolders, :module_folder})
     Application.put_env(@app, :attachments_folder_name, {MediaFolders, :no_such_hook})

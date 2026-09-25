@@ -14,11 +14,14 @@ defmodule PhoenixKit.Modules.Publishing.MediaReorganizer do
 
   Orphans — folders of a trashed or deleted group, reported, never moved:
   core's scan finds them by the deterministic name only, and only at the
-  root or under a parent a hook named for a live group. Every live folder a
-  trashed group points at is therefore reported here too, through the
-  pointer — whatever it is called and wherever it sits — unless core's scan
-  already reported that folder. A hard-deleted group's pointer went with the
-  row: its folder is reported only if core's scan finds it.
+  root or under a parent a hook named for a live group. Every live folder of
+  the site's Media library that a trashed group points at is therefore
+  reported here too, through the pointer — whatever it is called and
+  wherever it sits — once per folder, unless a live group points at it as
+  well (it is that group's) or core's scan already reported it. A folder in
+  another library is not the group's and is never reported. A hard-deleted
+  group's pointer went with the row: its folder is reported only if core's
+  scan finds it.
 
   What is publishing's own: a group is live until trashed, its pointer is
   `data["media_folder_uuid"]`, those pointer-found orphans, a
@@ -123,7 +126,13 @@ defmodule PhoenixKit.Modules.Publishing.MediaReorganizer do
       |> Enum.reject(fn {_group, folder} -> Map.has_key?(reported, folder.uuid) end)
 
     claimed = live_group_pointers(Enum.map(folders, fn {_group, folder} -> folder.uuid end))
-    folders = Enum.reject(folders, fn {_group, folder} -> folder.uuid in claimed end)
+
+    # Two trashed groups may point at one folder: it is reported once, for
+    # the older group.
+    folders =
+      folders
+      |> Enum.reject(fn {_group, folder} -> folder.uuid in claimed end)
+      |> Enum.uniq_by(fn {_group, folder} -> folder.uuid end)
 
     counts = counts(Enum.map(folders, fn {_group, folder} -> folder.uuid end))
 
@@ -186,7 +195,7 @@ defmodule PhoenixKit.Modules.Publishing.MediaReorganizer do
     case MediaAdoption.run(actor_uuid) do
       {:ok, %{groups: groups}} -> Enum.flat_map(groups, &unfiled_action/1)
       # Not opted in, or a hook that can't be called — reported by core
-      # (parent hook) or by `name_hook_problems/0` (name hook).
+      # (parent hook) or by `name_hook_problems/1` (name hook).
       {:error, _reason} -> []
     end
   end
