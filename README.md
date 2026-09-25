@@ -95,7 +95,7 @@ Post  (1) ──→ (many) PostView (one row per day)
 | mode | string | `"timestamp"` or `"slug"` — locked at creation |
 | status | string | `"active"` or `"trashed"` |
 | position | integer | Display ordering |
-| data | JSONB | type, item_singular/plural, icon, comments/likes/views_enabled |
+| data | JSONB | type, item_singular/plural, icon, comments/likes/views_enabled, `media_folder_uuid` (see [Media folders](#media-folders)) |
 | title_i18n | JSONB | Translatable group title (keyed by language code) |
 | description_i18n | JSONB | Translatable group description (keyed by language code) |
 
@@ -189,6 +189,9 @@ lib/phoenix_kit_publishing/
   renderer.ex                # Markdown + component rendering
   page_builder.ex            # PHK XML component system
   stale_fixer.ex             # Data consistency repair
+  media_folders.ex           # Group media folders + ready-made host hooks
+  media_adoption.ex          # One-time filing of existing post media
+  media_reorganizer.ex       # Plan source for core's media reorganizer
   presence.ex                # Collaborative editing presence
   pubsub.ex                  # Real-time broadcasting
   routes.ex                  # Admin route definitions
@@ -208,6 +211,9 @@ lib/phoenix_kit_publishing/
 | `Publishing.PageBuilder` | XML parser (Saxy) for `<Image>`, `<Hero>`, etc. components |
 | `Publishing.StaleFixer` | Reconciles DB/cache state, auto-cleans empty posts |
 | `Publishing.Presence` | Phoenix.Presence for collaborative editor locking |
+| `Publishing.MediaFolders` | One media folder per group; files picked in the editor go there |
+| `Publishing.MediaAdoption` | Files the media posts already use into their group's folder |
+| `Publishing.MediaReorganizer` | Group folders for `mix phoenix_kit.media.reorganize` |
 
 ## IEx / CLI Usage
 
@@ -373,6 +379,43 @@ Supported components: `Image`, `Hero`, `CTA`, `Headline`, `Subheadline`, `Video`
 | `publishing_memory_cache_enabled` | `true` | Listing cache toggle |
 | `publishing_render_cache_enabled` | `true` | Render cache global toggle |
 | `publishing_render_cache_enabled_<slug>` | `true` | Per-group render cache |
+| `publishing_media_folder_uuid` | — | The module's media folder, written by the ready-made media hook (see below) |
+
+## Media folders
+
+Off by default: a host that configures nothing keeps today's behaviour and no
+folder is created. To keep each group's media in its own folder —
+`Publishing/News`, `Publishing/Legal` — add the ready-made hooks:
+
+```elixir
+config :phoenix_kit_publishing,
+  attachments_parent_folder: {PhoenixKit.Modules.Publishing.MediaFolders, :module_folder},
+  attachments_folder_name: {PhoenixKit.Modules.Publishing.MediaFolders, :group_folder_name}
+```
+
+Or point either key at your own function (core's `Storage.ResourceFolders`
+convention): `parent_for(:group, actor_uuid, group)` answers
+`{:ok, folder_uuid}` or `nil` for the media root; `name_for(group, actor_uuid)`
+answers `{:ok, name}` or `nil` for `publishing-group-<uuid>`.
+
+Then, once:
+
+```bash
+mix phoenix_kit_publishing.media.adopt           # dry run: what would be filed
+mix phoenix_kit_publishing.media.adopt --apply   # file it
+```
+
+(In a release: `PhoenixKit.Modules.Publishing.MediaAdoption.run(actor_uuid, apply?: true)`.)
+
+This files every file a group's posts use — featured, OG and audio slots,
+`<Image>`/`<Audio>`/`<Showcase>` components, baked `/file/<uuid>/…` URLs — into
+the group's folder. A file with no folder is moved in; a file that already
+lives in another folder stays there and is linked in. File URLs do not change.
+
+From then on every file picked in the post editor lands in the group's folder
+by itself, and `mix phoenix_kit.media.reorganize` moves the group folders when
+you change the hooks later (it also reports a group whose files are outside its
+folder).
 
 ## Removing this module
 

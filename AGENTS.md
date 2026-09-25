@@ -11,7 +11,7 @@ the `PhoenixKit.Module` behaviour, so a host app gets it by adding the dependenc
 — no config, no route wiring. Public pages are served by a plain Phoenix
 controller (dead views); the admin side is LiveView.
 
-- **Depends on:** `phoenix_kit` `~> 2.14` (Hex), `phoenix_kit_ai` `~> 0.18`
+- **Depends on:** `phoenix_kit` `~> 2.38` (Hex), `phoenix_kit_ai` `~> 0.18`
   (hard — it owns the `Translatable` adapter behaviour, the per-language Oban
   fan-out, the LLM call and `ai_multilang_tabs/1`; publishing contributes only
   the adapters and the editor wiring), `phoenix_kit_comments` `~> 0.3`
@@ -29,12 +29,13 @@ controller (dead views); the admin side is LiveView.
   through `RouterDispatch`, not the router's route table.
 - **Module key** `"publishing"`; settings prefix `publishing_`.
 
-The core pin is a hard floor, not a preference (reasons in `mix.exs`):
-`PublishingGroup.changeset/2` needs `PhoenixKit.Utils.Slug.put_slug/3`, and
-`Constants.to_site_wall/2` / `from_site_wall/3` need a core that parses an IANA
-time-zone id rather than reading it as offset 0 — under an older core every
-timestamp post is stamped and syndicated on UTC while the editor shows the site
-clock. Don't lower it.
+The core pin is a hard floor, not a preference (reasons in `mix.exs`): the
+group media folders are built on core 2.38's `Storage.ResourceFolders` and the
+reorganizer's `ResourceSource`; `PublishingGroup.changeset/2` needs
+`PhoenixKit.Utils.Slug.put_slug/3`, and `Constants.to_site_wall/2` /
+`from_site_wall/3` need a core that parses an IANA time-zone id rather than
+reading it as offset 0 — under an older core every timestamp post is stamped
+and syndicated on UTC while the editor shows the site clock. Don't lower it.
 
 The `leaf` requirement is `~> 0.4.1 or ~> 0.5`, and the two-branch form is
 deliberate: plain `~> 0.4.1` reads as `< 0.5.0`, and because core declares
@@ -87,6 +88,12 @@ Deliberate non-features, so nobody adds them assuming they were missed.
 - **No guest commenting.** The comments seam requires a logged-in user because
   the comments schema `validate_required`s `user_uuid`; guest support is a
   cross-repo change in the comments module first.
+- **No media folders unless the host opts in, and none per post.** Group media
+  folders (`MediaFolders`) exist only once the host configures
+  `:attachments_parent_folder`; without it nothing is created or filed. Folders
+  are per group: posts have no JSONB column for a folder pointer and a title is
+  per language. The media picker stays unscoped (the whole library) — a picked
+  file is filed into the group folder after the choice, not browsed from it.
 
 ## Commands
 
@@ -346,6 +353,7 @@ lib/phoenix_kit_publishing/
 ├── {routes,router_dispatch}.ex                  # admin route tree; host-side public dispatch
 ├── migrations.ex                                # module-owned versioned migration chain (V1 = adoption)
 ├── stale_fixer.ex, activity_log.ex, group_settings.ex, comments.ex, gettext.ex
+├── media_folders.ex, media_adoption.ex, media_reorganizer.ex   # group media folders
 ├── listing_cache.ex (+ cache_sync, lock_table_owner), renderer.ex
 ├── page_builder.ex (+ parser, renderer, components/)
 ├── schemas/               # 6 Ecto schemas
@@ -373,6 +381,14 @@ lib/phoenix_kit_publishing/
   change mints a new key instead of needing a purge.
 - `Publishing.StaleFixer` — read-path repair; also auto-trashes empty posts past
   a grace period.
+- `Publishing.MediaFolders` / `MediaAdoption` / `MediaReorganizer` — one media
+  folder per group on core's `Storage.ResourceFolders` convention (pointer
+  `groups.data["media_folder_uuid"]`, ready-made hooks `module_folder/3` and
+  `group_folder_name/2`); the editor files every picked file into it,
+  `MediaAdoption` (`mix phoenix_kit_publishing.media.adopt`) files existing
+  post media once, and `MediaReorganizer` (`media_reorganizer/0`, core's
+  `ResourceSource`) moves the folders when the host's hooks change. Design:
+  `dev_docs/2026-09-25-publishing-media-reorganizer.md`.
 - `Publishing.Errors` — every public-API error tuple returns either an atom
   listed in `@type error_atom` or one of four tagged tuples
   (`{:ai_translation_failed, _}`, `{:ai_extract_failed, _}`,
