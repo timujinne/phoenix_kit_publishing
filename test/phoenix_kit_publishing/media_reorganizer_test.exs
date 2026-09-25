@@ -94,12 +94,36 @@ defmodule PhoenixKit.Modules.Publishing.MediaReorganizerTest do
   test "a trashed group's folder is an orphan, reported and left in place" do
     group = group!("Old", %{status: "trashed"})
     orphan = folder!("publishing-group-" <> group.uuid)
+    # Pointed at too: core's scan and the pointer both find it; one report.
+    point(group, orphan)
     configure_default_hooks()
 
     actions = run(apply?: true)
 
-    assert Enum.any?(actions, &(&1.op == :report and &1.kind == :orphan))
+    assert [%{op: :report, kind: :orphan}] = actions
     assert reload(orphan).parent_uuid == nil
+  end
+
+  test "a trashed group's folder that core's scan can't see is reported, once" do
+    configure_default_hooks()
+    {:ok, parent_uuid} = MediaFolders.module_folder(:group, nil, nil)
+    group = group!("Old", %{status: "trashed"})
+    folder = folder!("publishing-group-" <> group.uuid, parent_uuid)
+    point(group, folder)
+
+    # No live group has a folder, so no hook names `Publishing` as a parent
+    # and core's scan stays at the root.
+    assert [%{op: :report, kind: :orphan, folder: %{uuid: uuid}}] = run(apply?: true)
+    assert uuid == folder.uuid
+    assert reload(folder).parent_uuid == parent_uuid
+  end
+
+  test "a name hook that can't be called is reported even with nothing to move" do
+    Application.put_env(@app, :attachments_parent_folder, {MediaFolders, :module_folder})
+    Application.put_env(@app, :attachments_folder_name, {MediaFolders, :no_such_hook})
+
+    assert [%{op: :report, kind: :hook_error, reason: reason}] = run()
+    assert reason =~ "attachments_folder_name"
   end
 
   test "a trashed group's host-named folder is reported once, through its pointer" do

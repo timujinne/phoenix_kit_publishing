@@ -13,16 +13,19 @@ defmodule PhoenixKit.Modules.Publishing.MediaReorganizer do
   configured, nothing but reports.
 
   Orphans — folders of a trashed or deleted group, reported, never moved:
-  core's scan finds them by the deterministic name only (at the root or
-  under a parent a hook named), so a folder named by the host hook
-  (`News`) is reported here instead, for a trashed group, found through
-  its pointer. A hard-deleted group's host-named folder cannot be traced —
-  its pointer went with the row — and is not reported.
+  core's scan finds them by the deterministic name only, and only at the
+  root or under a parent a hook named for a live group. Every live folder a
+  trashed group points at is therefore reported here too, through the
+  pointer — whatever it is called and wherever it sits — unless core's scan
+  already reported that folder. A hard-deleted group's pointer went with the
+  row: its folder is reported only if core's scan finds it.
 
   What is publishing's own: a group is live until trashed, its pointer is
-  `data["media_folder_uuid"]`, those host-named orphans, and one more
-  report — `:unfiled`, a group whose posts use files still outside its
-  folder, for which `PhoenixKit.Modules.Publishing.MediaAdoption` (`mix
+  `data["media_folder_uuid"]`, those pointer-found orphans, a
+  `:hook_error` report for a name hook that cannot be called (core reports
+  the parent hook only, and asks the name hook only once a folder exists),
+  and `:unfiled` — a group whose posts use files still outside its folder,
+  for which `PhoenixKit.Modules.Publishing.MediaAdoption` (`mix
   phoenix_kit_publishing.media.adopt --apply`) is the fix. The reorganizer
   moves folders only; it never files a file.
   """
@@ -43,7 +46,17 @@ defmodule PhoenixKit.Modules.Publishing.MediaReorganizer do
   @doc "The plan (`Reorganizer.Source.plan/2`); `opts` takes `:pending_days`."
   @impl true
   @spec plan(String.t() | nil, keyword()) :: [map()]
-  def plan(actor_uuid, opts \\ []), do: ResourceSource.plan(spec(), actor_uuid, opts)
+  def plan(actor_uuid, opts \\ []) do
+    core = ResourceSource.plan(spec(), actor_uuid, opts)
+
+    reported =
+      for %{kind: :orphan, folder: %Folder{uuid: uuid}} <- core, into: %{}, do: {uuid, true}
+
+    core ++
+      name_hook_problems() ++
+      pointer_orphans(reported) ++
+      unfiled(actor_uuid, opts)
+  end
 
   defp spec do
     %{
@@ -58,28 +71,38 @@ defmodule PhoenixKit.Modules.Publishing.MediaReorganizer do
           pointer: MediaFolders.pointer(),
           live: &where(&1, [g], g.status != "trashed")
         }
-      ],
-      extra: &extra/2
+      ]
     }
   end
 
-  defp extra(actor_uuid, opts), do: host_named_orphans() ++ unfiled(actor_uuid, opts)
+  defp name_hook_problems do
+    MediaFolders.hook_problems()
+    |> Enum.filter(&String.starts_with?(&1, "attachments_folder_name"))
+    |> Enum.map(fn problem ->
+      %{
+        source: @source,
+        kind: :hook_error,
+        op: :report,
+        label: "attachments name hook",
+        counts: nil,
+        reason: problem
+      }
+    end)
+  end
 
-  # A trashed group's live folder whose name is not the deterministic one:
-  # core's orphan scan goes by that name only, so it would never see it.
-  defp host_named_orphans do
+  # Every live folder a trashed group points at, core's own orphan reports
+  # left out (`reported`), so no folder is reported twice.
+  defp pointer_orphans(reported) do
     folders =
       from(g in PublishingGroup,
         join: f in Folder,
         on: fragment("lower(?->>?)", g.data, ^pointer_key()) == type(f.uuid, :string),
         where: g.status == "trashed" and is_nil(f.trashed_at),
         order_by: [asc: g.inserted_at, asc: g.uuid],
-        select: {g, f}
+        select: {map(g, [:name, :slug]), f}
       )
       |> repo().all()
-      |> Enum.reject(fn {group, folder} ->
-        folder.name == MediaFolders.deterministic_name(group)
-      end)
+      |> Enum.reject(fn {_group, folder} -> Map.has_key?(reported, folder.uuid) end)
 
     counts = counts(Enum.map(folders, fn {_group, folder} -> folder.uuid end))
 
@@ -130,8 +153,8 @@ defmodule PhoenixKit.Modules.Publishing.MediaReorganizer do
   defp unfiled(actor_uuid, _opts) do
     case MediaAdoption.run(actor_uuid) do
       {:ok, %{groups: groups}} -> Enum.flat_map(groups, &unfiled_action/1)
-      # Not opted in, or a hook that can't be called — which core's own
-      # `:hook_error` report already names.
+      # Not opted in, or a hook that can't be called — reported by core
+      # (parent hook) or by `name_hook_problems/0` (name hook).
       {:error, _reason} -> []
     end
   end
