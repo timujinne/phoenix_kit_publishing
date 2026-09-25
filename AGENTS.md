@@ -88,12 +88,12 @@ Deliberate non-features, so nobody adds them assuming they were missed.
 - **No guest commenting.** The comments seam requires a logged-in user because
   the comments schema `validate_required`s `user_uuid`; guest support is a
   cross-repo change in the comments module first.
-- **No media folders unless the host opts in, and none per post.** Group media
-  folders (`MediaFolders`) exist only once the host configures
-  `:attachments_parent_folder`; without it nothing is created or filed. Folders
-  are per group: posts have no JSONB column for a folder pointer and a title is
-  per language. The media picker stays unscoped (the whole library) — a picked
-  file is filed into the group folder after the choice, not browsed from it.
+- **No media folders unless the host opts in.** Group media folders
+  (`MediaFolders`) exist only once the host configures
+  `:attachments_parent_folder`; post folders inside them only with
+  `:post_media_folders` too. Without them nothing is created or filed. The
+  media picker stays unscoped (the whole library) — a picked file is filed
+  into the post's or group's folder after the choice, not browsed from it.
 
 ## Commands
 
@@ -384,7 +384,10 @@ lib/phoenix_kit_publishing/
 - `Publishing.MediaFolders` / `MediaAdoption` / `MediaReorganizer` — one media
   folder per group on core's `Storage.ResourceFolders` convention (pointer
   `groups.data["media_folder_uuid"]`, ready-made hooks `module_folder/3` and
-  `group_folder_name/2`); the editor files every picked file into it,
+  `folder_name/2`), and with `:post_media_folders` one per post inside it
+  (pointer `data["media_folder_uuid"]` on every version of the post — posts
+  have no JSONB column, no migration); the editor files every picked file
+  into it,
   `MediaAdoption` (`mix phoenix_kit_publishing.media.adopt`) files existing
   post media once, and `MediaReorganizer` (`media_reorganizer/0`, core's
   `ResourceSource`) moves the folders when the host's hooks change. Design:

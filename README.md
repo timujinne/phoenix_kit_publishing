@@ -130,7 +130,7 @@ Each post has one or more versions. The version holds all metadata that applies 
 | status | string | `"draft"` / `"published"` / `"archived"` |
 | published_at | utc_datetime | When this version was first published |
 | created_by_uuid | UUIDv7 | FK → users (audit) |
-| data | JSONB | featured_image_uuid, tags, seo, description, allow_version_access, notes, created_from |
+| data | JSONB | featured_image_uuid, tags, seo, description, allow_version_access, notes, created_from, `media_folder_uuid` (the post's folder, on every version — see [Media folders](#media-folders)) |
 
 #### `phoenix_kit_publishing_contents` — Per-language title + body
 
@@ -390,13 +390,22 @@ folder is created. To keep each group's media in its own folder —
 ```elixir
 config :phoenix_kit_publishing,
   attachments_parent_folder: {PhoenixKit.Modules.Publishing.MediaFolders, :module_folder},
-  attachments_folder_name: {PhoenixKit.Modules.Publishing.MediaFolders, :group_folder_name}
+  attachments_folder_name: {PhoenixKit.Modules.Publishing.MediaFolders, :folder_name}
 ```
 
-Or point either key at your own function (core's `Storage.ResourceFolders`
+For a folder per post inside its group's — `Publishing/News/spring-fair`, a
+timestamp post's named by its date and time — add:
+
+```elixir
+config :phoenix_kit_publishing, :post_media_folders, true
+```
+
+Or point either hook key at your own function (core's `Storage.ResourceFolders`
 convention): `parent_for(:group, actor_uuid, group)` answers
-`{:ok, folder_uuid}` or `nil` for the media root; `name_for(group, actor_uuid)`
-answers `{:ok, name}` or `nil` for `publishing-group-<uuid>`.
+`{:ok, folder_uuid}` or `nil` for the media root; `name_for(subject, actor_uuid)`
+— a group, or a post with post folders on — answers `{:ok, name}` or `nil` for
+`publishing-group-<uuid>` / `publishing-post-<uuid>`. A group or post keeps its
+folder when it is renamed later.
 
 Then, once:
 
@@ -409,13 +418,17 @@ mix phoenix_kit_publishing.media.adopt --apply   # file it
 
 This files every file a group's posts use — featured, OG and audio slots,
 `<Image>`/`<Audio>`/`<Showcase>` components, baked `/file/<uuid>/…` URLs — into
-the group's folder. A file with no folder is moved in; a file that already
-lives in another folder stays there and is linked in. File URLs do not change.
+the group's folder, or each post's. A file with no folder is moved in; a file
+that already lives in another folder stays there and is linked in (with post
+folders, one in the group's own folder moves down into the post's). A file
+several posts use lives in the first post's folder and is linked into the
+others'. File URLs do not change.
 
-From then on every file picked in the post editor lands in the group's folder
-by itself, and `mix phoenix_kit.media.reorganize` moves the group folders when
-you change the hooks later (it also reports a group whose files are outside its
-folder, the folder of a trashed group, and a name hook that can't be called).
+From then on every file picked in the post editor lands in the post's (or
+group's) folder by itself, and `mix phoenix_kit.media.reorganize` moves the group folders when
+you change the hooks later — post folders travel with their group's (it also
+reports a group or post whose files are outside its folder, the folder of a
+trashed group or post, and a name hook that can't be called).
 With the ready-made hooks, even its dry run may create the `Publishing` folder
 if it is missing: the parent hook creates it on first use.
 
@@ -426,14 +439,15 @@ group is left unfiled rather than filed at the media root.
 
 > #### Trashing a group's folder trashes the posts' pictures {: .warning}
 >
-> After adoption, a file that used to have no folder lives in its group's
-> folder. Moving `Publishing/<group>` (or `Publishing` itself) to the trash in
+> After adoption, a file that used to have no folder lives in its group's (or
+> post's) folder. Moving `Publishing/<group>`, a post's folder, or `Publishing`
+> itself to the trash in
 > the media browser trashes every file whose home is inside it — including one
 > that is also shown somewhere else by URL (a page, another module) — and those
 > pictures stop showing until the folder is restored from the trash. A file
 > that is only *linked* into the folder keeps its own home and is not affected.
 > Rename or move these folders freely; trash them only together with their
-> group.
+> group or post.
 
 ## Removing this module
 
