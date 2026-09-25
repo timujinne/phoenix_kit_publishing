@@ -59,8 +59,9 @@ a file with no home is **adopted** (its `folder_uuid` becomes the group
 folder); a file already homed elsewhere — another group, another module, a
 person's own folder — is **linked** (`FolderLink`), never moved. A file used by
 two groups is homed by the first (groups in `position`, `inserted_at`, uuid
-order) and linked into the others. A trashed file, or one in another storage
-library, is reported and left alone.
+order) and linked into the others. A trashed file, a system-managed one (tile
+chunks, an edited image's hidden original), or one in another storage library
+is reported and left alone.
 
 ## Three moving parts
 
@@ -85,20 +86,27 @@ library, is reported and left alone.
    `mix phoenix_kit.media.reorganize`: when a host changes its hooks, the group
    folders move under the new parent (pointer back-fill for a folder found by
    its deterministic name). Orphans: core's scan reports a deterministic-named
-   folder of a trashed or deleted group (at the root or under a parent a hook
-   named); a host-named one (`News`) of a trashed group is reported by
-   publishing's own `extra`, through the pointer. A hard-deleted group's
-   host-named folder cannot be traced (its pointer went with the row). The
-   other `extra` report (`:unfiled`) lists groups whose files are still outside
-   their folder, so the core dry run tells the host when step 1 is needed.
+   folder of a trashed or deleted group, but only at the root or under a
+   parent a hook named for a live group; publishing adds every live folder a
+   trashed group points at (any name, anywhere) that core did not already
+   report. A hard-deleted group's pointer went with the row, so only core's
+   scan can find its folder. `extra`-style reports also cover a name hook
+   that can't be called (core reports only the parent hook) and `:unfiled`,
+   groups whose files are still outside their folder, so the core dry run
+   tells the host when step 1 is needed. With the ready-made parent hook, a
+   core dry run can create the `Publishing` folder: the hook is called for any
+   group that has a folder, and creating it on first use is the hook's job.
 
 ## Libraries
 
-Core's by-name folder lookups (`ResourceFolders.find_under/2`, `resolve/1`)
-do not look at the storage library (V202/V203), so a `Publishing` or `News`
-folder at the root of a person's private library could be taken for the
-module's. Publishing looks the module folder up in Media only and never adopts
-a group folder outside Media; new folders go to Media (the column default).
+Core's by-name folder lookups (`ResourceFolders.find_under/2`, `resolve/1`,
+the "name taken" check in `ensure/4`) do not look at the storage library
+(V202/V203) and take the first row without an order, so a `Publishing` or
+`News` folder at the root of a person's private library could be taken for
+the module's, or push a group onto its fallback name. Publishing does its own
+lookups in Media, oldest first — the module folder, a group's folder by host
+or deterministic name, a group's or the module's pointer — and asks `ensure/4`
+only to create; new folders go to Media (the column default).
 
 ## Baked URLs
 

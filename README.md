@@ -415,7 +415,9 @@ lives in another folder stays there and is linked in. File URLs do not change.
 From then on every file picked in the post editor lands in the group's folder
 by itself, and `mix phoenix_kit.media.reorganize` moves the group folders when
 you change the hooks later (it also reports a group whose files are outside its
-folder, and the folder of a trashed group).
+folder, the folder of a trashed group, and a name hook that can't be called).
+With the ready-made hooks, even its dry run may create the `Publishing` folder
+if it is missing: the parent hook creates it on first use.
 
 Folders are only ever looked up and created in the site's media library
 (Media), never in a person's own library. If a configured hook cannot be
