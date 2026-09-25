@@ -21,7 +21,7 @@ defmodule PhoenixKit.Modules.Publishing.MediaFoldersTest do
 
   defp configure_default_hooks do
     Application.put_env(@app, :attachments_parent_folder, {MediaFolders, :module_folder})
-    Application.put_env(@app, :attachments_folder_name, {MediaFolders, :group_folder_name})
+    Application.put_env(@app, :attachments_folder_name, {MediaFolders, :folder_name})
   end
 
   defp live_folders_named(name) do
@@ -84,13 +84,13 @@ defmodule PhoenixKit.Modules.Publishing.MediaFoldersTest do
     end
   end
 
-  describe "group_folder_name/2 (the ready-made name hook)" do
+  describe "folder_name/2 (the ready-made name hook)" do
     test "names the folder after the group" do
-      assert MediaFolders.group_folder_name(group!("News"), nil) == {:ok, "News"}
+      assert MediaFolders.folder_name(group!("News"), nil) == {:ok, "News"}
     end
 
     test "has no name for anything that is not a saved group" do
-      assert MediaFolders.group_folder_name(%{name: "News"}, nil) == nil
+      assert MediaFolders.folder_name(%{name: "News"}, nil) == nil
     end
   end
 
@@ -224,11 +224,10 @@ defmodule PhoenixKit.Modules.Publishing.MediaFoldersTest do
 
     test "a group deleted meanwhile leaves no folder behind" do
       configure_default_hooks()
-      {:ok, _} = MediaFolders.module_folder(:group, nil, nil)
       group = group!("News")
       Repo.delete!(group)
 
-      assert {:error, _reason} = MediaFolders.ensure_group_folder(group, nil)
+      assert MediaFolders.ensure_group_folder(group, nil) == {:error, :not_found}
       assert live_folders_named("News") == []
     end
 

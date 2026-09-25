@@ -20,7 +20,7 @@ defmodule PhoenixKit.Modules.Publishing.MediaReorganizerTest do
 
   defp configure_default_hooks do
     Application.put_env(@app, :attachments_parent_folder, {MediaFolders, :module_folder})
-    Application.put_env(@app, :attachments_folder_name, {MediaFolders, :group_folder_name})
+    Application.put_env(@app, :attachments_folder_name, {MediaFolders, :folder_name})
   end
 
   defp run(opts \\ []) do
@@ -133,11 +133,12 @@ defmodule PhoenixKit.Modules.Publishing.MediaReorganizerTest do
   test "a folder two trashed groups point at is reported once" do
     configure_default_hooks()
     shared = folder!("Shared")
-    point(group!("Old", %{status: "trashed"}), shared)
     point(group!("Older", %{status: "trashed"}), shared)
+    point(group!("Newer", %{status: "trashed"}), shared)
 
-    assert [%{kind: :orphan, folder: %{uuid: uuid}}] = run()
+    assert [%{kind: :orphan, folder: %{uuid: uuid}, reason: reason}] = run()
     assert uuid == shared.uuid
+    assert reason =~ "group Older"
   end
 
   test "a broken name hook core already reported is not reported twice" do
