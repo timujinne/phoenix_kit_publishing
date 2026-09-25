@@ -21,16 +21,21 @@ defmodule PhoenixKitPublishing.Test.MediaFixtures do
 
   @doc """
   A post of `group` with one version (`version_data`) and one content row
-  per `{language, body, content_data}` in `contents`.
+  per `{language, body, content_data}` in `contents`. `slug:` (a slug-mode
+  post) or `at: {date, time}` (a timestamp-mode one); `versions: n` adds
+  further, empty versions.
   """
   def post!(group, opts \\ []) do
     {:ok, post} =
-      DBStorage.create_post(%{
-        group_uuid: group.uuid,
-        mode: "slug",
-        slug: "p-#{System.unique_integer([:positive])}",
-        trashed_at: Keyword.get(opts, :trashed_at)
-      })
+      opts
+      |> post_attrs()
+      |> Map.merge(%{group_uuid: group.uuid, trashed_at: Keyword.get(opts, :trashed_at)})
+      |> DBStorage.create_post()
+
+    for n <- 2..Keyword.get(opts, :versions, 1)//1 do
+      {:ok, _} =
+        DBStorage.create_version(%{post_uuid: post.uuid, version_number: n, status: "draft"})
+    end
 
     {:ok, version} =
       DBStorage.create_version(%{
@@ -53,6 +58,16 @@ defmodule PhoenixKitPublishing.Test.MediaFixtures do
     end
 
     post
+  end
+
+  defp post_attrs(opts) do
+    case Keyword.get(opts, :at) do
+      {date, time} ->
+        %{mode: "timestamp", post_date: date, post_time: time}
+
+      nil ->
+        %{mode: "slug", slug: Keyword.get(opts, :slug, "p-#{System.unique_integer([:positive])}")}
+    end
   end
 
   def file!(attrs \\ %{}) do
@@ -139,4 +154,9 @@ defmodule PhoenixKitPublishing.Test.MediaHooks do
   def boom(_kind, _actor_uuid, _group), do: raise("hook bug")
   def news(_group, _actor_uuid), do: {:ok, "News"}
   def too_long(_group, _actor_uuid), do: {:ok, String.duplicate("N", 300)}
+
+  def groups_only(%PhoenixKit.Modules.Publishing.PublishingGroup{name: name}, _actor_uuid),
+    do: {:ok, name}
+
+  def groups_only(_post, _actor_uuid), do: raise("no name for a post")
 end

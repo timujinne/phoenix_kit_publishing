@@ -36,7 +36,7 @@ defmodule PhoenixKit.Modules.Publishing.Web.EditorMediaFoldersTest do
 
   defp opt_in do
     Application.put_env(@app, :attachments_parent_folder, {MediaFolders, :module_folder})
-    Application.put_env(@app, :attachments_folder_name, {MediaFolders, :group_folder_name})
+    Application.put_env(@app, :attachments_folder_name, {MediaFolders, :folder_name})
   end
 
   defp open_editor(conn, slug, post) do
@@ -95,6 +95,24 @@ defmodule PhoenixKit.Modules.Publishing.Web.EditorMediaFoldersTest do
       choose(view, [file.uuid])
 
       assert_filed(file, slug)
+    end
+
+    test "with post folders on, a pick lands in the post's folder inside the group's",
+         %{conn: conn, slug: slug, post: post} do
+      Application.put_env(@app, :post_media_folders, true)
+      on_exit(fn -> Application.delete_env(@app, :post_media_folders) end)
+      file = file!()
+      view = open_editor(conn, slug, post)
+
+      render_click(view, "open_media_selector", %{"field" => "featured_image_uuid"})
+      choose(view, [file.uuid])
+
+      eventually(fn ->
+        folder = MediaFolders.post_folder(post[:uuid])
+        assert %{parent_uuid: parent} = folder
+        assert parent == group_folder_uuid(slug)
+        assert reload(file).folder_uuid == folder.uuid
+      end)
     end
 
     test "an OG image lands there", %{conn: conn, slug: slug, post: post} do

@@ -2778,8 +2778,8 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor do
 
   defp files_used_by(_kind, _file_ids), do: []
 
-  # Group media folders are the host's opt-in (`MediaFolders`); without it
-  # this is a config read and nothing else. With it, the filing — a folder
+  # Group (and post) media folders are the host's opt-in (`MediaFolders`);
+  # without it this is a config read and nothing else. With it, the filing — a folder
   # lookup and one transaction per file, a gallery's worth — runs in a task
   # so the picker closes at once; a file that can't be filed is logged there
   # and never gets in the way of the edit.
@@ -2788,14 +2788,20 @@ defmodule PhoenixKit.Modules.Publishing.Web.Editor do
   defp file_into_group_folder(socket, file_uuids) do
     if MediaFolders.enabled?() do
       group_slug = socket.assigns.group_slug
+      post_uuid = post_uuid(socket.assigns[:post])
       actor_uuid = Shared.actor_uuid_from_socket(socket)
-      file = fn -> MediaFolders.file_for_group(group_slug, file_uuids, actor_uuid) end
+      file = fn -> MediaFolders.file_for_post(group_slug, post_uuid, file_uuids, actor_uuid) end
 
       start_filing(file)
     end
 
     :ok
   end
+
+  # A new post has no uuid until its first save; its picks go to the
+  # group's folder (adoption moves them down into the post's later).
+  defp post_uuid(%{uuid: uuid}) when is_binary(uuid), do: uuid
+  defp post_uuid(_post), do: nil
 
   # Core's task supervisor, as the view counter uses it; a host without one
   # running is an exit (noproc), and the filing then runs in place.

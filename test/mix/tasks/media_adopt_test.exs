@@ -20,7 +20,7 @@ defmodule Mix.Tasks.PhoenixKitPublishing.Media.AdoptTest do
 
   defp configure_default_hooks do
     Application.put_env(@app, :attachments_parent_folder, {MediaFolders, :module_folder})
-    Application.put_env(@app, :attachments_folder_name, {MediaFolders, :group_folder_name})
+    Application.put_env(@app, :attachments_folder_name, {MediaFolders, :folder_name})
   end
 
   defp output do

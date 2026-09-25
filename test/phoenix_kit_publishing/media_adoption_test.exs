@@ -12,7 +12,7 @@ defmodule PhoenixKit.Modules.Publishing.MediaAdoptionTest do
 
   setup do
     Application.put_env(@app, :attachments_parent_folder, {MediaFolders, :module_folder})
-    Application.put_env(@app, :attachments_folder_name, {MediaFolders, :group_folder_name})
+    Application.put_env(@app, :attachments_folder_name, {MediaFolders, :folder_name})
 
     on_exit(fn ->
       Application.delete_env(@app, :attachments_parent_folder)
@@ -20,7 +20,8 @@ defmodule PhoenixKit.Modules.Publishing.MediaAdoptionTest do
     end)
   end
 
-  defp entry(report, group), do: Enum.find(report.groups, &(&1.group_uuid == group.uuid))
+  defp entry(report, group),
+    do: Enum.find(report.entries, &(&1.kind == :group and &1.group_uuid == group.uuid))
 
   defp group_folder(group), do: Repo.get!(Folder, reload(group).data["media_folder_uuid"])
 

@@ -65,13 +65,13 @@ defmodule Mix.Tasks.PhoenixKitPublishing.Media.Adopt do
 
             config :phoenix_kit_publishing,
               attachments_parent_folder: {PhoenixKit.Modules.Publishing.MediaFolders, :module_folder},
-              attachments_folder_name: {PhoenixKit.Modules.Publishing.MediaFolders, :group_folder_name}
+              attachments_folder_name: {PhoenixKit.Modules.Publishing.MediaFolders, :folder_name}
         """)
     end
   end
 
-  defp failures?(%{groups: groups}),
-    do: Enum.any?(groups, &match?(%{result: %{failed: [_ | _]}}, &1))
+  defp failures?(%{entries: entries}),
+    do: Enum.any?(entries, &match?(%{result: %{failed: [_ | _]}}, &1))
 
   defp first_owner_uuid do
     case Roles.users_with_role("Owner") do

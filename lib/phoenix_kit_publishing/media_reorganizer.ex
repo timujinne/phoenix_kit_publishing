@@ -23,11 +23,16 @@ defmodule PhoenixKit.Modules.Publishing.MediaReorganizer do
   group's pointer went with the row: its folder is reported only if core's
   scan finds it.
 
+  Post folders (`MediaFolders.post_folders?/0`) are never planned: they sit
+  inside their group's folder and move with it. A trashed post's folder is
+  reported the same way, through the pointer its versions hold (a folder a
+  live post points at too is not); a hard-deleted post's is not traced.
+
   What is publishing's own: a group is live until trashed, its pointer is
   `data["media_folder_uuid"]`, those pointer-found orphans, a
   `:hook_error` report for a name hook that cannot be called (core reports
   the parent hook only, and asks the name hook only once a folder exists),
-  and `:unfiled` — a group whose posts use files still outside its folder,
+  and `:unfiled` — a group or post whose files are still outside its folder,
   for which `PhoenixKit.Modules.Publishing.MediaAdoption` (`mix
   phoenix_kit_publishing.media.adopt --apply`) is the fix. The reorganizer
   moves folders only; it never files a file.
@@ -40,6 +45,8 @@ defmodule PhoenixKit.Modules.Publishing.MediaReorganizer do
   alias PhoenixKit.Modules.Publishing.MediaAdoption
   alias PhoenixKit.Modules.Publishing.MediaFolders
   alias PhoenixKit.Modules.Publishing.PublishingGroup
+  alias PhoenixKit.Modules.Publishing.PublishingPost
+  alias PhoenixKit.Modules.Publishing.PublishingVersion
   alias PhoenixKit.Modules.Storage.File, as: StorageFile
   alias PhoenixKit.Modules.Storage.{Folder, FolderLink, Libraries}
   alias PhoenixKit.Modules.Storage.Reorganizer.ResourceSource
@@ -55,9 +62,17 @@ defmodule PhoenixKit.Modules.Publishing.MediaReorganizer do
     reported =
       for %{kind: :orphan, folder: %Folder{uuid: uuid}} <- core, into: %{}, do: {uuid, true}
 
+    group_orphans = pointer_orphans(reported)
+
+    reported =
+      Enum.reduce(group_orphans, reported, fn %{folder: folder}, acc ->
+        Map.put(acc, folder.uuid, true)
+      end)
+
     core ++
       name_hook_problems(core) ++
-      pointer_orphans(reported) ++
+      group_orphans ++
+      post_orphans(reported) ++
       unfiled(actor_uuid, opts)
   end
 
@@ -153,6 +168,65 @@ defmodule PhoenixKit.Modules.Publishing.MediaReorganizer do
 
   defp pointer_key, do: elem(MediaFolders.pointer(), 1)
 
+  # Post folders (`MediaFolders.post_folders?/0`) are never moved by this
+  # source — they sit inside their group's folder and travel with it. A
+  # trashed post's live Media folder is reported, the same way as a trashed
+  # group's: through the pointer its versions hold, once per folder, not
+  # when a live post points at it too, not when already reported. A
+  # hard-deleted post's versions went with it, and its folder is not
+  # traced.
+  defp post_orphans(reported) do
+    folders =
+      from(v in PublishingVersion,
+        join: p in PublishingPost,
+        on: p.uuid == v.post_uuid,
+        join: f in Folder,
+        on: fragment("lower(?->>?)", v.data, ^pointer_key()) == type(f.uuid, :string),
+        where: not is_nil(p.trashed_at) and is_nil(f.trashed_at),
+        where: f.library_uuid == ^Libraries.media_uuid(),
+        order_by: [asc: p.inserted_at, asc: p.uuid],
+        select: {map(p, [:uuid, :slug]), f}
+      )
+      |> repo().all()
+      |> Enum.reject(fn {_post, folder} -> Map.has_key?(reported, folder.uuid) end)
+
+    claimed = live_post_pointers(Enum.map(folders, fn {_post, folder} -> folder.uuid end))
+
+    folders =
+      folders
+      |> Enum.reject(fn {_post, folder} -> folder.uuid in claimed end)
+      |> Enum.uniq_by(fn {_post, folder} -> folder.uuid end)
+
+    counts = counts(Enum.map(folders, fn {_post, folder} -> folder.uuid end))
+
+    Enum.map(folders, fn {post, folder} ->
+      {files, _links} = folder_counts = Map.get(counts, folder.uuid, {0, 0})
+
+      %{
+        source: @source,
+        kind: :orphan,
+        op: :report,
+        label: folder.name,
+        folder: folder,
+        counts: folder_counts,
+        reason: "post #{post.slug || post.uuid} is trashed, #{files} file(s)"
+      }
+    end)
+  end
+
+  defp live_post_pointers([]), do: []
+
+  defp live_post_pointers(folder_uuids) do
+    from(v in PublishingVersion,
+      join: p in PublishingPost,
+      on: p.uuid == v.post_uuid,
+      where: is_nil(p.trashed_at),
+      where: fragment("lower(?->>?)", v.data, ^pointer_key()) in ^folder_uuids,
+      select: fragment("lower(?->>?)", v.data, ^pointer_key())
+    )
+    |> repo().all()
+  end
+
   defp live_group_pointers([]), do: []
 
   defp live_group_pointers(folder_uuids) do
@@ -193,27 +267,29 @@ defmodule PhoenixKit.Modules.Publishing.MediaReorganizer do
   # A dry adoption plan: reads only, calls no hook.
   defp unfiled(actor_uuid, _opts) do
     case MediaAdoption.run(actor_uuid) do
-      {:ok, %{groups: groups}} -> Enum.flat_map(groups, &unfiled_action/1)
+      {:ok, %{entries: entries}} -> Enum.flat_map(entries, &unfiled_action/1)
       # Not opted in, or a hook that can't be called — reported by core
       # (parent hook) or by `name_hook_problems/1` (name hook).
       {:error, _reason} -> []
     end
   end
 
-  defp unfiled_action(%{adopt: [], link: []}), do: []
+  defp unfiled_action(%{adopt: [], link: [], rehome: [], relocate: false}), do: []
 
   defp unfiled_action(entry) do
-    count = length(entry.adopt) + length(entry.link)
+    count = length(entry.adopt) + length(entry.rehome) + length(entry.link)
+    moved = if entry.relocate, do: "its folder is under another group's; ", else: ""
 
     [
       %{
         source: @source,
         kind: :unfiled,
-        label: "group #{entry.name} (#{entry.slug})",
+        label: "#{entry.kind} #{entry.name} (#{entry.slug})",
         op: :report,
         reason:
-          "#{count} file(s) its posts use are outside its media folder " <>
-            "(#{length(entry.adopt)} to adopt, #{length(entry.link)} to link) — run " <>
+          "#{moved}#{count} file(s) its posts use are outside its media folder " <>
+            "(#{length(entry.adopt)} to adopt, #{length(entry.rehome)} to move down, " <>
+            "#{length(entry.link)} to link) — run " <>
             "`mix phoenix_kit_publishing.media.adopt --apply` " <>
             "(or PhoenixKit.Modules.Publishing.MediaAdoption.run(actor_uuid, apply?: true))"
       }
