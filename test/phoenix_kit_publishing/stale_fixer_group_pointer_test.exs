@@ -9,6 +9,7 @@ defmodule PhoenixKit.Modules.Publishing.StaleFixerGroupPointerTest do
 
   import PhoenixKitPublishing.Test.MediaFixtures
 
+  alias PhoenixKit.Modules.Publishing.DBStorage
   alias PhoenixKit.Modules.Publishing.StaleFixer
   alias PhoenixKit.Modules.Storage.ResourceFolders
 
@@ -29,6 +30,19 @@ defmodule PhoenixKit.Modules.Publishing.StaleFixerGroupPointerTest do
     assert fixed.data["type"] == "custom"
     assert reload(stale).data["type"] == "custom"
     assert reload(stale).data["media_folder_uuid"] == folder.uuid
+  end
+
+  test "a fix the row no longer needs is not written from the stale struct" do
+    stale = group!("News", %{data: %{"type" => "no-such-type"}})
+
+    {:ok, _} =
+      DBStorage.update_group(stale, %{
+        data: Map.put(stale.data, "type", "blog")
+      })
+
+    StaleFixer.fix_stale_group(stale)
+
+    assert reload(stale).data["type"] == "blog"
   end
 
   test "a group that needs no fix is not written" do
