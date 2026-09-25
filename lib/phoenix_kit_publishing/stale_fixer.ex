@@ -57,27 +57,26 @@ defmodule PhoenixKit.Modules.Publishing.StaleFixer do
     apply_stale_fix(group, attrs, &update_group_fixes/2)
   end
 
-  # The fixes are computed from a struct that may be older than the row (a
-  # listing loaded before an edit), so a `data` fix is merged key by key onto
-  # the FRESH, locked row rather than written whole: a whole-map write from
-  # the stale struct wiped every key written since — the group's
-  # `media_folder_uuid` pointer among them.
-  defp update_group_fixes(group, %{data: fixed_data} = attrs) do
+  # The fixes were computed from a struct that may be older than the row (a
+  # listing loaded before an edit). Writing them — a whole `data` map among
+  # them — from that struct wiped every key written since, the group's
+  # `media_folder_uuid` pointer included. So the row is locked, the fixes
+  # are recomputed from it, and only those are written.
+  defp update_group_fixes(group, _stale_attrs) do
     repo = RepoHelper.repo()
-    stale_data = group.data || %{}
-    changed = Map.filter(fixed_data, fn {key, value} -> Map.get(stale_data, key) != value end)
 
     repo.transaction(fn ->
       fresh = DBStorage.lock_group_row!(repo, group.uuid) || group
 
-      case DBStorage.update_group(fresh, %{attrs | data: Map.merge(fresh.data || %{}, changed)}) do
+      case write_group_fixes(fresh, build_group_fixes(fresh)) do
         {:ok, updated} -> updated
         {:error, reason} -> repo.rollback(reason)
       end
     end)
   end
 
-  defp update_group_fixes(group, attrs), do: DBStorage.update_group(group, attrs)
+  defp write_group_fixes(fresh, attrs) when attrs == %{}, do: {:ok, fresh}
+  defp write_group_fixes(fresh, attrs), do: DBStorage.update_group(fresh, attrs)
 
   defp build_group_fixes(group) do
     data = group.data || %{}
