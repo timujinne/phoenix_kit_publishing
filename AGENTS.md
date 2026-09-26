@@ -11,7 +11,9 @@ the `PhoenixKit.Module` behaviour, so a host app gets it by adding the dependenc
 — no config, no route wiring. Public pages are served by a plain Phoenix
 controller (dead views); the admin side is LiveView.
 
-- **Depends on:** `phoenix_kit` `~> 2.38` (Hex), `phoenix_kit_ai` `~> 0.18`
+- **Depends on:** `phoenix_kit` `>= 2.38.0 and < 3.0.0` (Hex — the release that carries 
+  `PhoenixKitWeb.Actor`, `Activity.log/3` and `Components.TreePicker`; the compound form 
+  keeps the ceiling open across later 2.x minors), `phoenix_kit_ai` `~> 0.18`
   (hard — it owns the `Translatable` adapter behaviour, the per-language Oban
   fan-out, the LLM call and `ai_multilang_tabs/1`; publishing contributes only
   the adapters and the editor wiring), `phoenix_kit_comments` `~> 0.3`
@@ -268,9 +270,9 @@ Four rules; the mechanism is in
 ### Activity logging
 
 Every mutation logs through `PhoenixKit.Modules.Publishing.ActivityLog`, a thin
-wrapper over `PhoenixKit.Activity.log/1` that injects `module: "publishing"`,
-guards with `Code.ensure_loaded?/1`, and rescues so an audit failure can never
-crash the mutation it describes. Three call shapes:
+wrapper over core's `PhoenixKit.Activity.log/1` that injects
+`module: "publishing"`; core never raises, so an audit failure can never crash
+the mutation it describes. Three call shapes:
 
 ```elixir
 # Standard user-driven mutation — every CRUD context fn.
@@ -286,8 +288,8 @@ ActivityLog.log(%{action: …, mode: "auto", resource_type: …, resource_uuid: 
 Rules: metadata is PII-safe keys only — `ActivityLog.reason_string/1` collapses
 an `%Ecto.Changeset{}` to `"changeset_error"` precisely because a changeset
 carries submitted names and free text. LiveView callers thread the actor with
-`Shared.actor_uuid_from_socket/1` rather than reading
-`socket.assigns.phoenix_kit_current_scope.user.uuid` inline. Failures log too, as
+`Shared.actor_uuid_from_socket/1` (core's `PhoenixKitWeb.Actor`: the scope
+first, then the bare current user) rather than reading assigns inline. Failures log too, as
 `db_pending` rows via `log_failed_mutation/5`, so a vanished admin action stays
 auditable. Patterns and the auto-event details are in
 [dev_docs/guides/activity-logging.md](dev_docs/guides/activity-logging.md).
@@ -442,7 +444,10 @@ Group (1) ──→ (many) Post (1) ──→ (many) Version (1) ──→ (many
   site default → first available.
 - **`..._categories`** — hierarchical per-group taxonomy; nullable `parent_uuid`
   self-FK, `slug` unique per group, `name_i18n` display names. Deleting a group
-  cascades; deleting a parent lifts children to the root.
+  cascades; deleting a parent lifts children to the root. A parent is picked in
+  core's `TreePicker` (the category form and the Move dialog), never an
+  indented flat select; the tree leaves out the category's own subtree and the
+  context still refuses a cycle.
 - **`..._post_categories`** — post ↔ category M:N, post-level not per-version.
   Both sides cascade.
 - **`..._post_views`** — one `(post_uuid, view_date)` counter row per day, queried

@@ -14,6 +14,7 @@ defmodule PhoenixKit.Modules.Publishing.Web.EditLiveTest do
 
   use PhoenixKitPublishing.LiveCase
 
+  alias PhoenixKit.Modules.Languages
   alias PhoenixKit.Modules.Publishing.Groups
   alias PhoenixKit.Settings
 
@@ -33,7 +34,9 @@ defmodule PhoenixKit.Modules.Publishing.Web.EditLiveTest do
       |> put_test_scope(fake_scope())
       |> live("/admin/publishing/edit-group/#{group["slug"]}")
 
-    assert html =~ "Edit Group"
+    # The header trail owns the shape (Publishing / <group> / Edit); the
+    # page title is the last step only.
+    assert html =~ "<title>Edit</title>"
     assert html =~ group["name"]
     assert html =~ group["slug"]
     assert html =~ ~s|phx-disable-with="Saving…"|
@@ -219,5 +222,24 @@ defmodule PhoenixKit.Modules.Publishing.Web.EditLiveTest do
     {:ok, saved} = Groups.get_group(group["slug"])
     assert saved["show_reading_time"] == true
     assert saved["post_width"] == "wide"
+  end
+
+  describe "the language it opens on" do
+    setup do
+      {:ok, _} = Languages.enable_system()
+      {:ok, _} = Languages.add_language("fr-FR")
+      :ok
+    end
+
+    test "viewed in French, the group form opens on the French tab",
+         %{conn: conn, group: group} do
+      {:ok, view, _html} =
+        conn
+        |> put_test_scope(fake_scope())
+        |> with_request_locale("fr-FR")
+        |> live("/admin/publishing/edit-group/#{group["slug"]}")
+
+      assert :sys.get_state(view.pid).socket.assigns.current_lang == "fr-FR"
+    end
   end
 end

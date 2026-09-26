@@ -10,6 +10,7 @@ defmodule PhoenixKit.Modules.Publishing.Web.CategoriesLiveTest do
 
   alias PhoenixKit.Modules.Publishing.Categories
   alias PhoenixKit.Modules.Publishing.Groups
+  alias PhoenixKit.Utils.Tree
 
   defp unique_name, do: "catlv-#{System.unique_integer([:positive])}"
 
@@ -62,12 +63,55 @@ defmodule PhoenixKit.Modules.Publishing.Web.CategoriesLiveTest do
     |> element("button[phx-value-uuid='#{parent.uuid}'][phx-click='new_child']")
     |> render_click()
 
-    assert has_element?(view, "#category-form option[selected][value='#{parent.uuid}']")
+    assert has_element?(view, parent_input("category", parent.uuid))
 
     view
-    |> form("#category-form", category: %{"name" => "Child", "parent_uuid" => parent.uuid})
+    |> form("#category-form", category: %{"name" => "Child"})
     |> render_submit()
 
+    assert [{%{name: "Parent"}, 0}, {%{name: "Child"}, 1}] = Categories.list_tree(slug)
+  end
+
+  test "a parent picked in the form's tree is where the category saves", %{
+    conn: conn,
+    slug: slug
+  } do
+    {:ok, parent} = Categories.create_category(slug, %{"name" => "Parent"})
+    {:ok, view, _} = live(conn, "/admin/publishing/categories/#{slug}")
+    view |> element("button[phx-click='new']") |> render_click()
+
+    view |> element("#category-parent-picker-change") |> render_click()
+    view |> element(row("category-parent-picker", parent.uuid)) |> render_click()
+    assert has_element?(view, parent_input("category", parent.uuid))
+
+    # The top-level row takes it back to no parent.
+    view |> element("#category-parent-picker-change") |> render_click()
+    view |> element(row("category-parent-picker", "root")) |> render_click()
+    assert has_element?(view, parent_input("category", ""))
+
+    view |> element("#category-parent-picker-change") |> render_click()
+    view |> element(row("category-parent-picker", parent.uuid)) |> render_click()
+    view |> form("#category-form", category: %{"name" => "Child"}) |> render_submit()
+
+    assert [{%{name: "Parent"}, 0}, {%{name: "Child"}, 1}] = Categories.list_tree(slug)
+  end
+
+  test "a validate still carrying the old parent does not undo a pick", %{
+    conn: conn,
+    slug: slug
+  } do
+    {:ok, parent} = Categories.create_category(slug, %{"name" => "Parent"})
+    {:ok, view, _} = live(conn, "/admin/publishing/categories/#{slug}")
+    view |> element("button[phx-click='new']") |> render_click()
+
+    view |> element("#category-parent-picker-change") |> render_click()
+    view |> element(row("category-parent-picker", parent.uuid)) |> render_click()
+
+    # A keystroke sent before the pick's patch reached the browser.
+    render_change(view, "validate", %{"category" => %{"name" => "Chi", "parent_uuid" => ""}})
+    assert has_element?(view, parent_input("category", parent.uuid))
+
+    render_submit(view, "save", %{"category" => %{"name" => "Child", "parent_uuid" => ""}})
     assert [{%{name: "Parent"}, 0}, {%{name: "Child"}, 1}] = Categories.list_tree(slug)
   end
 
@@ -82,15 +126,55 @@ defmodule PhoenixKit.Modules.Publishing.Web.CategoriesLiveTest do
     {:ok, view, _} = live(conn, "/admin/publishing/categories/#{slug}")
     view |> element("button[phx-value-uuid='#{a.uuid}'][phx-click='edit']") |> render_click()
 
-    html = render(view)
-    # The select offers only valid parents: not A itself, not its child B.
-    refute html =~ ~s(<option value="#{a.uuid}")
-    refute html =~ ~s(<option value="#{b.uuid}")
-    assert html =~ ~s(<option value="#{other.uuid}")
+    view |> element("#category-parent-picker-change") |> render_click()
+    # The picker offers only valid parents: not A itself, not its child B.
+    refute has_element?(view, row("category-parent-picker", a.uuid))
+    refute has_element?(view, row("category-parent-picker", b.uuid))
+    assert has_element?(view, row("category-parent-picker", other.uuid))
 
     # The context still guards a raced/direct invalid re-parent.
     assert {:error, :category_cycle} =
              Categories.update_category(a.uuid, %{"parent_uuid" => b.uuid})
+  end
+
+  test "Save after a move made elsewhere keeps the category where it is", %{
+    conn: conn,
+    slug: slug
+  } do
+    {:ok, p} = Categories.create_category(slug, %{"name" => "P"})
+    {:ok, q} = Categories.create_category(slug, %{"name" => "Q"})
+    {:ok, c} = Categories.create_category(slug, %{"name" => "C", "parent_uuid" => p.uuid})
+
+    {:ok, view, _} = live(conn, "/admin/publishing/categories/#{slug}")
+    view |> element("button[phx-value-uuid='#{c.uuid}'][phx-click='edit']") |> render_click()
+
+    # Another admin moves C under Q while this form sits open on P.
+    {:ok, _} = Categories.move_category(c.uuid, q.uuid)
+
+    view
+    |> form("#category-form", category: %{"name" => "C renamed", "slug" => c.slug})
+    |> render_submit()
+
+    {:ok, reloaded} = Categories.get_category(c.uuid)
+    assert reloaded.name == "C renamed"
+    assert reloaded.parent_uuid == q.uuid
+  end
+
+  test "a parent picked on the form still moves the category", %{conn: conn, slug: slug} do
+    {:ok, p} = Categories.create_category(slug, %{"name" => "P"})
+    {:ok, c} = Categories.create_category(slug, %{"name" => "C", "parent_uuid" => p.uuid})
+
+    {:ok, view, _} = live(conn, "/admin/publishing/categories/#{slug}")
+    view |> element("button[phx-value-uuid='#{c.uuid}'][phx-click='edit']") |> render_click()
+    view |> element("#category-parent-picker-change") |> render_click()
+    view |> element(row("category-parent-picker", Tree.root_id())) |> render_click()
+
+    view
+    |> form("#category-form", category: %{"name" => "C", "slug" => c.slug})
+    |> render_submit()
+
+    {:ok, reloaded} = Categories.get_category(c.uuid)
+    assert reloaded.parent_uuid == nil
   end
 
   test "Move-to dialog re-parents a category", %{conn: conn, slug: slug} do
@@ -103,14 +187,12 @@ defmodule PhoenixKit.Modules.Publishing.Web.CategoriesLiveTest do
     |> element("button[phx-value-uuid='#{b.uuid}'][phx-click='open_move']")
     |> render_click()
 
-    # The dialog excludes B itself from the target list.
-    html = render(view)
-    assert html =~ "Move"
-    refute html =~ ~s(<option value="#{b.uuid}")
+    # The dialog excludes B itself from the target tree.
+    assert render(view) =~ "Move"
+    refute has_element?(view, row("category-move-picker", b.uuid))
 
-    view
-    |> form("#category-move-form", move: %{"parent_uuid" => a.uuid})
-    |> render_submit()
+    view |> element(row("category-move-picker", a.uuid)) |> render_click()
+    view |> form("#category-move-form") |> render_submit()
 
     {:ok, reloaded} = Categories.get_category(b.uuid)
     assert reloaded.parent_uuid == a.uuid
@@ -201,6 +283,77 @@ defmodule PhoenixKit.Modules.Publishing.Web.CategoriesLiveTest do
     assert render(view) =~ "A"
   end
 
+  test "Move takes the picked target, not a stale or crafted post", %{conn: conn, slug: slug} do
+    {:ok, a} = Categories.create_category(slug, %{"name" => "A"})
+    {:ok, b} = Categories.create_category(slug, %{"name" => "B"})
+    {:ok, view, _} = live(conn, "/admin/publishing/categories/#{slug}")
+
+    view |> element("button[phx-value-uuid='#{b.uuid}'][phx-click='open_move']") |> render_click()
+    view |> element(row("category-move-picker", a.uuid)) |> render_click()
+
+    # Sent before the pick's patch landed: still the old, top-level value.
+    render_submit(view, "confirm_move", %{"move" => %{"parent_uuid" => ""}})
+
+    {:ok, reloaded} = Categories.get_category(b.uuid)
+    assert reloaded.parent_uuid == a.uuid
+  end
+
+  test "a save and a move from the page are logged with the signed-in actor", %{
+    conn: conn,
+    slug: slug
+  } do
+    editor = "019cce93-0000-7000-8000-00000000e7e7"
+    conn = put_test_scope(conn, fake_scope(user_uuid: editor))
+    {:ok, a} = Categories.create_category(slug, %{"name" => "A"})
+    {:ok, b} = Categories.create_category(slug, %{"name" => "B"})
+    {:ok, view, _} = live(conn, "/admin/publishing/categories/#{slug}")
+
+    view |> element("button[phx-value-uuid='#{a.uuid}'][phx-click='edit']") |> render_click()
+
+    view
+    |> form("#category-form", category: %{"name" => "A2", "slug" => a.slug})
+    |> render_submit()
+
+    view |> element("button[phx-value-uuid='#{b.uuid}'][phx-click='open_move']") |> render_click()
+    view |> element(row("category-move-picker", a.uuid)) |> render_click()
+    render_submit(view, "confirm_move", %{})
+
+    for uuid <- [a.uuid, b.uuid] do
+      assert_activity_logged("publishing.category.updated",
+        resource_uuid: uuid,
+        actor_uuid: editor
+      )
+    end
+  end
+
+  test "a category id that is not a uuid is not found, not a crash", %{slug: slug} do
+    assert {:error, :not_found} = Categories.get_category("not-a-uuid")
+    assert {:error, :not_found} = Categories.move_category("not-a-uuid", nil)
+    {:ok, lone} = Categories.create_category(slug, %{"name" => "Lone"})
+    assert {:error, :not_found} = Categories.update_category("not-a-uuid", %{"name" => "x"})
+    {:ok, still} = Categories.get_category(lone.uuid)
+    assert still.name == "Lone"
+  end
+
+  test "a move to a parent that is not a uuid is refused, not a crash", %{slug: slug} do
+    {:ok, lone} = Categories.create_category(slug, %{"name" => "Lone"})
+    assert {:error, :parent_not_found} = Categories.move_category(lone.uuid, "root")
+    {:ok, still} = Categories.get_category(lone.uuid)
+    assert still.parent_uuid == nil
+  end
+
+  test "a parent that is not a uuid is refused, not a crash", %{conn: conn, slug: slug} do
+    assert {:error, :parent_not_found} =
+             Categories.create_category(slug, %{"name" => "X", "parent_uuid" => "root"})
+
+    {:ok, view, _} = live(conn, "/admin/publishing/categories/#{slug}")
+    render_click(view, "new_child", %{"uuid" => "not-a-uuid"})
+
+    html = render_submit(view, "save", %{"category" => %{"name" => "Orphan"}})
+    assert html =~ "That parent no longer exists."
+    assert Categories.list_tree(slug) == []
+  end
+
   test "Move-to dialog preselects the current parent", %{conn: conn, slug: slug} do
     {:ok, a} = Categories.create_category(slug, %{"name" => "A"})
     {:ok, b} = Categories.create_category(slug, %{"name" => "B", "parent_uuid" => a.uuid})
@@ -212,9 +365,9 @@ defmodule PhoenixKit.Modules.Publishing.Web.CategoriesLiveTest do
     |> render_click()
 
     # Submitting the dialog untouched must NOT silently re-parent to root.
-    assert has_element?(view, "#category-move-form option[selected][value='#{a.uuid}']")
+    assert has_element?(view, parent_input("move", a.uuid))
 
-    view |> form("#category-move-form", move: %{"parent_uuid" => a.uuid}) |> render_submit()
+    view |> form("#category-move-form") |> render_submit()
     {:ok, reloaded} = Categories.get_category(b.uuid)
     assert reloaded.parent_uuid == a.uuid
   end
@@ -250,4 +403,11 @@ defmodule PhoenixKit.Modules.Publishing.Web.CategoriesLiveTest do
 
     assert to =~ "/admin/publishing"
   end
+
+  # Parents are picked in core's TreePicker, which posts the pick through a
+  # hidden input and renders one button per offered row.
+  defp parent_input(form, uuid),
+    do: ~s(input[type="hidden"][name="#{form}[parent_uuid]"][value="#{uuid}"])
+
+  defp row(picker, uuid), do: ~s(##{picker} [data-tree-node="#{uuid}"])
 end

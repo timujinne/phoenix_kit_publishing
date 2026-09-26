@@ -136,11 +136,13 @@ defmodule PhoenixKit.Modules.Publishing.Categories do
     _ -> {:error, :not_found}
   end
 
-  @doc "A category by uuid."
+  @doc "A category by uuid. Anything that is not a uuid is `:not_found`, never a raise."
   def get_category(uuid) when is_binary(uuid) do
-    case repo().get(PublishingCategory, uuid) do
-      nil -> {:error, :not_found}
-      category -> {:ok, category}
+    with {:ok, _} <- Ecto.UUID.cast(uuid),
+         %PublishingCategory{} = category <- repo().get(PublishingCategory, uuid) do
+      {:ok, category}
+    else
+      _ -> {:error, :not_found}
     end
   end
 
@@ -212,7 +214,7 @@ defmodule PhoenixKit.Modules.Publishing.Categories do
   # returning the struct is the only success path out of here.
   defp write_category_update(category, attrs, opts) do
     category
-    |> PublishingCategory.changeset(stringify_keys(attrs))
+    |> PublishingCategory.changeset(attrs |> stringify_keys() |> resolve_position(category))
     |> repo().update()
     |> case do
       {:ok, updated} ->
@@ -231,6 +233,21 @@ defmodule PhoenixKit.Modules.Publishing.Categories do
         repo().rollback(changeset)
     end
   end
+
+  # `move_category/3` asks for the end of the new sibling group with
+  # `"position" => :append`; it is resolved here, after the group lock, so two
+  # moves under one parent at the same moment cannot both read the same max.
+  defp resolve_position(%{"position" => :append} = attrs, category) do
+    parent =
+      case attrs["parent_uuid"] do
+        blank when blank in [nil, ""] -> nil
+        parent -> parent
+      end
+
+    Map.put(attrs, "position", next_position(category, parent))
+  end
+
+  defp resolve_position(attrs, _category), do: attrs
 
   # A cycle check answers a question about the whole tree, so two re-parents
   # in the same group have to take turns asking it. Both transactions used to
@@ -400,26 +417,28 @@ defmodule PhoenixKit.Modules.Publishing.Categories do
   `update_category/3`'s.
   """
   def move_category(uuid, new_parent_uuid, opts \\ []) do
-    with {:ok, category} <- get_category(uuid) do
-      parent = if new_parent_uuid in [nil, ""], do: nil, else: new_parent_uuid
+    case move_parent(new_parent_uuid) do
+      # The position is resolved inside `update_category/3`, under the
+      # group lock (`resolve_position/2`).
+      {:ok, _parent} ->
+        update_category(uuid, %{"parent_uuid" => new_parent_uuid, "position" => :append}, opts)
 
-      next_position =
-        from(c in PublishingCategory,
-          where: c.group_uuid == ^category.group_uuid,
-          where: ^parent_condition(parent),
-          select: max(c.position)
-        )
-        |> repo().one()
-        |> case do
-          nil -> 0
-          max -> max + 1
-        end
+      # Not a uuid: `update_category/3` refuses it (and logs the attempt).
+      :error ->
+        update_category(uuid, %{"parent_uuid" => new_parent_uuid}, opts)
+    end
+  end
 
-      update_category(
-        uuid,
-        %{"parent_uuid" => new_parent_uuid, "position" => next_position},
-        opts
-      )
+  defp next_position(category, parent) do
+    from(c in PublishingCategory,
+      where: c.group_uuid == ^category.group_uuid,
+      where: ^parent_condition(parent),
+      select: max(c.position)
+    )
+    |> repo().one()
+    |> case do
+      nil -> 0
+      max -> max + 1
     end
   end
 
@@ -835,10 +854,25 @@ defmodule PhoenixKit.Modules.Publishing.Categories do
 
   # nil parent (root) is always valid; otherwise the parent must exist, be
   # same-group, and — on update — not be the category or its descendant.
+  # The parent a move names, as a uuid the position query can bind.
+  defp move_parent(parent) when parent in [nil, ""], do: {:ok, nil}
+  defp move_parent(parent), do: Ecto.UUID.cast(parent)
+
   defp validate_parent(nil, _group_uuid, _category), do: :ok
   defp validate_parent("", _group_uuid, _category), do: :ok
 
   defp validate_parent(parent_uuid, group_uuid, category) when is_binary(parent_uuid) do
+    # Not a uuid names no category — a crafted value must not reach
+    # `Repo.get`, which raises a cast error on it.
+    case Ecto.UUID.cast(parent_uuid) do
+      {:ok, uuid} -> validate_parent_row(uuid, group_uuid, category)
+      :error -> {:error, :parent_not_found}
+    end
+  end
+
+  defp validate_parent(_bad, _group_uuid, _category), do: {:error, :parent_not_found}
+
+  defp validate_parent_row(parent_uuid, group_uuid, category) do
     case repo().get(PublishingCategory, parent_uuid) do
       nil ->
         {:error, :parent_not_found}
@@ -854,8 +888,6 @@ defmodule PhoenixKit.Modules.Publishing.Categories do
         {:error, :parent_wrong_group}
     end
   end
-
-  defp validate_parent(_bad, _group_uuid, _category), do: {:error, :parent_not_found}
 
   # Walks up from `node_uuid` looking for `ancestor_uuid`. Depth-capped so a
   # pre-existing corrupt loop can't spin this forever.
